@@ -1,31 +1,47 @@
-# Game Boy app for Solana OS (badge firmware)
+# Retro: Game Boy, Game Boy Color and NES for Solana OS (badge firmware)
 
-A built-in C app that plays a `.gb` ROM from the microSD card. No ROM is included.
+A built-in C app: pick a console, then a game from its folder on the microSD card. No games
+are included.
 
 ## Files
 
-- `main/apps/gbemu/gbemu_app.c`: the app (ROM list, emulator task, display, input, saves)
-- `main/apps/gbemu/peanut_gb.h`: Peanut-GB core (MIT, licence in the file header),
-  https://github.com/deltabeard/Peanut-GB at commit d0bcca771c83a2638c93a9ae61f3d51f226dc905.
-- Registered in `main/sources.cmake` (badge + browser emulator) and `main/apps/registry.c`.
+- `gbemu_app.c`: the app (menus, emulator task, display, input, saves)
+- `walnut_cgb.h`: Walnut-CGB core for Game Boy and Game Boy Color (MIT, licence in the file
+  header), https://github.com/Mr-PauI/Walnut-CGB at commit a42c186917516cc9c80515ceae1121600a071628
+- `nes/agnes.c`, `nes/agnes.h`: agnes NES core (MIT, licence in the file headers),
+  https://github.com/kgabis/agnes at commit 0e4220b084c467e39c04805d955e78c463feadd0
+- `nes/agnes_build.c`: builds `agnes.c` unchanged with `-Wtype-limits` off
+- Registered in `main/sources.cmake` (badge + browser emulator) and `main/apps/registry.c`
 
 ## Use
 
-1. Copy a ROM to the card: `/roms/<name>.gb` (or the card root). Without a card reader,
-   over the USB cable: `python tools/sd_put.py --port COM5 <file>.gb roms/<name>.gb`
+1. Copy games to the card:
+
+   | Console | File | Folder |
+   |---|---|---|
+   | Game Boy | `.gb` | `roms/gb` (also `roms/`) |
+   | Game Boy Color | `.gbc` | `roms/gbc` |
+   | NES | `.nes` | `roms/nes` |
+
+   Without a card reader, over the USB cable:
+   `python tools/sd_put.py --port COM5 <file>.nes roms/nes/<name>.nes`
    (ESP-IDF's Python has pyserial; about 8 KB/s, so a 1 MB file takes about 2 minutes).
-2. Open **Game Boy** in the launcher, pick the ROM, press SELECT.
+2. Open **Retro** in the launcher, pick the console, pick the game, press SELECT. CANCEL goes
+   back to the consoles.
 3. Controls: d-pad = d-pad, SELECT = A, CANCEL = B, UP+DOWN = START, LEFT+RIGHT = SELECT.
-   BOOT (back of the badge) quits. The save is written to `<name>.sav` on quit and
-   every minute while it changes.
+   BOOT (back of the badge) quits.
+4. Saves: Game Boy cart RAM goes to `<name>.sav` on quit and every minute while it changes.
+   NES saves the whole machine to `<name>.state` on quit and continues from there next time.
 
 ## Design notes
 
-- Emulator runs in its own task at idle priority and yields every frame, so the OS,
+- The emulator runs in its own task at idle priority and yields every frame, so the OS,
   LVGL and radios always preempt it. The browser emulator's tasks are cooperative, which
   is why the yield is needed there.
-- Picture: 160x144 scaled 1.5x to 240x216 (the app area is 320x218). Double-buffered
-  RGB565 in PSRAM, swapped under the LVGL lock, so there's no tearing.
-- Peanut-GB frame skip is on: all 60 frames are emulated and every other one is drawn.
-- Console logs `emulated fps / shown fps / resyncs` every 5 s. That's the speed measurement.
-- No sound: the README of solana-os lists no speaker.
+- Picture: Game Boy 160x144 scaled 1.5x to 240x216. NES 256x240 shown 1:1 with 11 rows cut
+  at the top and bottom (256x218), the app area's height. Double-buffered RGB565 in PSRAM,
+  swapped under the LVGL lock, so there's no tearing.
+- Every frame is emulated and every other one is drawn.
+- The console logs `emulated fps / shown fps / resyncs` every 5 s per system. That's the speed
+  measurement.
+- No sound: the solana-os README lists no speaker.

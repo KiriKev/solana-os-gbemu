@@ -1,12 +1,14 @@
-# Tutorial: a Game Boy emulator app for the Solana OS badge
+# Tutorial: Retro, a Game Boy / Game Boy Color / NES app for the Solana OS badge
 
-This walks through how the Game Boy app on branch `feat/gbemu-app` was built, flashed and
-tested on a Breakpoint 2026 badge, from a Windows PC. No game ships with it: you play a ROM
-you dumped from a cartridge you own, or free homebrew.
+This walks through how the Retro app on branch `feat/gbemu-app` was built, flashed and
+tested on a Breakpoint 2026 badge, from a Windows PC. No game ships with it: you play games
+you dumped from cartridges you own, or free homebrew. For the beginner version of the setup,
+see `GBEMU_SETUP.txt` in the repo root.
 
 What you end up with:
 
-- A **Game Boy** app in the badge launcher that lists `.gb` files on the microSD card and plays them.
+- A **Retro** app in the badge launcher: pick a console (Game Boy, Game Boy Color, NES), then a
+  game from its folder on the microSD card (`roms/gb`, `roms/gbc`, `roms/nes`).
 - An `sdrecv` console command plus `tools/sd_put.py`, so files go onto the card over the USB cable.
 - A full backup of the badge's flash, and the command to restore it.
 
@@ -72,30 +74,54 @@ Before writing code, read these. They are how every app works:
 - `main/core/os_keys.h`, `components/bsp/include/bsp.h`, `main/core/theme.h`: keys, buttons,
   SD card, and the app area (320 x 218 below the status bar).
 
-## 4. Add the emulator core
+## 4. Add the emulator cores
 
-The CPU and graphics come from **Peanut-GB**, a single MIT-licensed C header. Put
-`peanut_gb.h` next to the app:
+Two small MIT-licensed cores do the emulation:
+
+- **Walnut-CGB** (`walnut_cgb.h`, one header) runs Game Boy and Game Boy Color games. It reads
+  the cartridge header and switches to colour mode by itself. The first version of the app
+  used Peanut-GB, which Walnut-CGB grew out of. Peanut-GB has no colour mode.
+- **agnes** (`agnes.c` + `agnes.h`) runs NES games. It supports the NROM, UxROM, MMC1 and MMC3
+  cartridge types, which covers most NES games.
 
 ```bash
-curl -fsSL -o main/apps/gbemu/peanut_gb.h https://raw.githubusercontent.com/deltabeard/Peanut-GB/master/peanut_gb.h
+curl -fsSL -o main/apps/gbemu/walnut_cgb.h https://raw.githubusercontent.com/Mr-PauI/Walnut-CGB/a42c186917516cc9c80515ceae1121600a071628/walnut_cgb.h
 ```
 
-Configure it before the include. The badge has no speaker, so sound is off:
+```bash
+curl -fsSL -o main/apps/gbemu/nes/agnes.c https://raw.githubusercontent.com/kgabis/agnes/0e4220b084c467e39c04805d955e78c463feadd0/agnes.c
+```
+
+```bash
+curl -fsSL -o main/apps/gbemu/nes/agnes.h https://raw.githubusercontent.com/kgabis/agnes/0e4220b084c467e39c04805d955e78c463feadd0/agnes.h
+```
+
+Configure Walnut-CGB before the include. The badge has no speaker, so sound is off:
 
 ```c
 #define ENABLE_SOUND                0
 #define ENABLE_LCD                  1
-#define PEANUT_GB_IS_LITTLE_ENDIAN  1       // RISC-V and wasm
-#include "peanut_gb.h"
+#define WALNUT_GB_IS_LITTLE_ENDIAN  1       // RISC-V and wasm
+#define WALNUT_FULL_GBC_SUPPORT     1
+struct gb_s;                                // the header uses it in prototypes before defining it
+#include "walnut_cgb.h"
 ```
+
+Two build errors came from the cores, and both are worked around without editing the
+vendored files:
+
+1. `'struct gb_s' declared inside parameter list`: that's what the `struct gb_s;` line above fixes.
+2. agnes trips `-Wtype-limits`, which is an error in this build. `nes/agnes_build.c` turns that
+   warning off and includes `agnes.c`, and the build lists `agnes_build.c` instead of `agnes.c`.
 
 ## 5. Write the app (`main/apps/gbemu/gbemu_app.c`)
 
 The app has five parts.
 
-**ROM list.** `on_enter` checks the card (`bsp_sd_get_info`), scans `/sdcard/roms` and
-`/sdcard` for `.gb`/`.gbc` files and shows them in a `ui_list`. SELECT starts the chosen ROM.
+**Menus.** `on_enter` checks the card (`bsp_sd_get_info`) and shows the three consoles in a
+`ui_list`, each with how many games its folder holds. SELECT opens the console's game list
+(`roms/gb` plus the older `roms/` for Game Boy, `roms/gbc`, `roms/nes`). SELECT on a game
+starts it, and CANCEL goes back to the consoles.
 
 **Emulator task.** Frames can't run inside OS callbacks (they must not block), so the
 emulator gets its own FreeRTOS task:
@@ -107,10 +133,10 @@ xTaskCreate(emu_task, "gbemu", 6144, NULL, tskIDLE_PRIORITY, &s_task);
 - **Idle priority** means the OS, LVGL and the radios always preempt it.
 - The task calls `vTaskDelay(0)` every frame. That lets the idle task run and keeps the task
   watchdog quiet. It's also required in the browser emulator, whose tasks are cooperative.
-- It paces itself to 59.73 frames per second with `esp_timer_get_time()`. Peanut-GB's
+- It paces itself to 59.73 frames per second (60.1 for NES) with `esp_timer_get_time()`. Walnut-CGB's
   `frame_skip` is on, so it emulates all 60 frames but draws every other one.
 
-**Picture.** Peanut-GB calls `draw_line()` once per screen line with 160 palette indices. The
+**Picture.** Walnut-CGB calls `draw_line()` once per screen line with 160 palette indices. The
 app scales 160x144 by 1.5 into 240x216, which fits the 320x218 app area: every 2 source pixels
 become 3, even lines are written twice and odd lines once. The output goes into one of two
 RGB565 buffers in PSRAM. When a frame is complete, the app swaps which buffer the LVGL image
@@ -123,6 +149,12 @@ lvgl_port_unlock();
 ```
 
 LVGL only ever reads the front buffer, so there's no tearing.
+
+Colour games: in colour mode, each pixel value indexes Walnut-CGB's ready-made RGB565 palette
+(`gb->cgb.fixPalette`). Original Game Boy games get a 4-shade green palette.
+
+NES: agnes renders 256x240. The app shows it 1:1 and cuts 11 rows at the top and bottom so it
+fits the 218-row app area (`nes_draw()`). Like the Game Boy, it draws every other frame.
 
 **Input.** Each frame the task reads `bsp_buttons_get()` through the calibrated key map
 (`os_key_button()`):
@@ -138,22 +170,23 @@ LVGL only ever reads the front buffer, so there's no tearing.
 
 Opposite directions never reach a game, so these chords are safe.
 
-**Saves.** Cart RAM is loaded from `<rom>.sav`, and written back on quit and every minute while
-it changes. `on_exit` sets a quit flag and waits for the task. The task never waits on the LVGL
+**Saves.** Game Boy cart RAM is loaded from `<rom>.sav`, and written back on quit and every
+minute while it changes. NES games save the whole machine (`agnes_dump_state`) to
+`<rom>.state` on quit and restore it at the next start. `on_exit` sets a quit flag and waits for the task. The task never waits on the LVGL
 lock that `on_exit` holds, because `present()` gives up after 4 ms, so there's no deadlock.
 
 The app is an `os_app_t`:
 
 ```c
 const os_app_t app_gbemu = {
-    .id = "gbemu", .name = "Game Boy", .symbol = LV_SYMBOL_PLAY, .accent = COL_GREEN,
+    .id = "retro", .name = "Retro", .symbol = LV_SYMBOL_PLAY, .accent = COL_GREEN,
     .on_enter = enter, .on_exit = leave, .on_key = key,
 };
 ```
 
 ## 6. Register it (two one-line edits)
 
-- `main/sources.cmake`: add `apps/gbemu/gbemu_app.c` to `SOLANA_OS_SRCS`. Both the badge and
+- `main/sources.cmake`: add `apps/gbemu/gbemu_app.c apps/gbemu/nes/agnes_build.c` to `SOLANA_OS_SRCS`. Both the badge and
   the browser emulator build from that list.
 - `main/apps/registry.c`: add `app_gbemu` to the `extern` line and `&app_gbemu,` to `os_apps[]`.
 
@@ -220,13 +253,14 @@ after the size and SHA-256 match. From cmd, no environment needed (ESP-IDF's Pyt
 pyserial):
 
 ```bat
-D:\esp\.espressif\python_env\idf6.0_py3.13_env\Scripts\python.exe D:\Projects\solana-os\tools\sd_put.py --port COM5 "C:\path\to\game.gb" roms/game.gb
+D:\esp\.espressif\python_env\idf6.0_py3.13_env\Scripts\python.exe D:\Projects\solana-os\tools\sd_put.py --port COM5 "C:\path\to\game.gb" roms/gb/game.gb
 ```
 
-It runs at about 8 KB/s and ends with `done: roms/game.gb, ... SHA-256 checked`. A wrong
+Use `roms/gbc/` for Game Boy Color and `roms/nes/` for NES. It runs at about 8 KB/s and ends
+with `done: roms/gb/game.gb, ... SHA-256 checked`. A wrong
 checksum is refused with `recv: error the SHA-256 doesn't match`, and no partial file is left.
 
-Then open **Game Boy** in the launcher, pick the game and press SELECT.
+Then open **Retro** in the launcher, pick the console, then the game, and press SELECT.
 
 **Measure.** The app logs `emulated fps / shown fps / resyncs` every 5 s on the console
 (115200 baud). Read it with any serial monitor while a game runs.

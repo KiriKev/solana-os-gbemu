@@ -69,3 +69,10 @@ Options: PR upstream; App Store (Lua only, ruled out in DEC-08 notes and docs/GB
 Decision: Fork KiriKev/solana-os-gbemu with feat/gbemu-app as the default branch, a README banner, GBEMU_SETUP.txt (beginner steps with the reason for each, plus how to add the app to an existing checkout) and docs/GBEMU_TUTORIAL.md.
 Evidence: REPORTED (chat message relayed by Kev 2026-11-14).
 Revert: set main back as the default branch; remove the banner and the two docs.
+
+### DEC-2026-11-14-11: Retro app: Walnut-CGB (GB + GBC) and agnes (NES), console menu first
+Context: Kev wants one app that plays Game Boy, Game Boy Color and NES, picking the console first, then the game. Peanut-GB has no colour mode (0 matches for cgb in peanut_gb.h).
+Options: Retro-Go (GPL, replaces Solana OS, no ESP32-C5 target); two MIT cores in the existing app.
+Decision: Walnut-CGB a42c1869 replaces Peanut-GB (deletion in its own commit), agnes 0e4220b0 for NES via nes/agnes_build.c (-Wtype-limits off, vendored file unchanged), `struct gb_s;` forward declaration for walnut_cgb.h's prototypes. Folders roms/gb (+ legacy roms/), roms/gbc, roms/nes. App id "retro", name "Retro"; folder and symbol names stay gbemu to keep the diff small. NES picture 256x218 (11 rows cut top and bottom), NES saves as an agnes state on quit.
+Evidence: VERIFIED `idf.py build`: Project build complete, solana_os.bin 0x245ca0 bytes, 43% free; flashed to the badge on COM5 ("Hash of data verified"); badge console `apps` lists "retro    Retro" and `open retro` logs "os: app: retro". NOT VERIFIED: a GBC or NES game running on the badge, and the fps of either.
+Revert: git revert of this commit, then the Peanut-GB deletion commit.

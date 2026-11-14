@@ -1,23 +1,24 @@
-GAME BOY EMULATOR FOR THE SOLANA OS BADGE
+RETRO: GAME BOY, GAME BOY COLOR AND NES ON THE SOLANA OS BADGE
 Step-by-step setup for beginners (Windows)
 
 WHAT THIS IS
-  This adds a "Game Boy" app to your Breakpoint 2026 badge. You copy a Game Boy
-  game file (a ".gb" file) onto the badge's memory card, open the app, and play.
+  This adds a "Retro" app to your Breakpoint 2026 badge. You copy game files onto
+  the badge's memory card, open Retro, choose the console, choose the game, play.
 
-  No games are included. Use a game you copied from your own cartridge, or a free
-  homebrew game that its makers share online.
+    Console          File ending     Folder on the card
+    Game Boy         .gb             roms/gb   (roms/ works too)
+    Game Boy Color   .gbc            roms/gbc
+    NES              .nes            roms/nes
 
-  Original Game Boy games only (.gb), shown in shades of green. Game Boy Color
-  games that also run on the original Game Boy work, in green. Games made only for
-  the Game Boy Color don't start, and NES games aren't supported.
+  No games are included. Use games you copied from your own cartridges, or free
+  homebrew games that their makers share online.
 
 WHY IT TAKES A FEW STEPS
   Apps in the badge's App Store are small Lua scripts. Lua is too slow to pretend
-  to be a whole Game Boy, so this app is written in C and built into the badge's
-  operating system (Solana OS). That means you build your own copy of Solana OS
-  with the app inside, and put it on the badge. It takes 30-60 minutes the first
-  time, mostly waiting for downloads.
+  to be a whole game console, and Lua apps can't read the games folder. So Retro is
+  written in C and built into the badge's operating system (Solana OS). That means
+  you build your own copy of Solana OS with Retro inside and put it on the badge.
+  The first time takes 30-60 minutes, mostly waiting for downloads.
 
 WHAT YOU NEED
   - The badge, with a microSD card in it
@@ -27,10 +28,11 @@ WHAT YOU NEED
     Git downloads code, and Python runs the badge tools.
 
 HOW TO TYPE THE COMMANDS
-  Open the Start menu, type "PowerShell" and open "Windows PowerShell".
+  Open the Start menu, type "PowerShell" and open "Windows PowerShell". Don't use
+  the black "Command Prompt" or "Git Bash": the commands below are for PowerShell.
   Copy one command at a time, paste it into the window (right-click), press Enter,
-  and wait until it finishes before the next one. The lines below that start with
-  spaces are commands; everything else is explanation.
+  and wait until it finishes before the next one. The indented lines are commands;
+  everything else is explanation.
 
 
 STEP 1 - Install the badge's build tools (once)
@@ -43,8 +45,7 @@ STEP 1 - Install the badge's build tools (once)
     $env:IDF_TOOLS_PATH='D:\esp\.espressif'; D:\esp\esp-idf\install.ps1 esp32c5
 
   This downloads about 1-2 GB. It's done when it says "All done!".
-  Use PowerShell for this, not "Git Bash": the installer refuses to run there.
-  (D:\esp is just a folder with space. Use C:\esp in both lines if you have no D: drive.)
+  (D:\esp is just a folder with space. Use C:\esp everywhere if you have no D: drive.)
 
 
 STEP 2 - Turn the tools on
@@ -54,9 +55,9 @@ STEP 2 - Turn the tools on
     $env:IDF_TOOLS_PATH='D:\esp\.espressif'; . D:\esp\esp-idf\export.ps1
 
 
-STEP 3 - Download the code with the Game Boy app
+STEP 3 - Download the code with Retro in it
 
-    git clone -b feat/gbemu-app https://github.com/KiriKev/solana-os-gbemu.git D:\solana-os-gbemu
+    git clone https://github.com/KiriKev/solana-os-gbemu.git D:\solana-os-gbemu
 
     cd D:\solana-os-gbemu
 
@@ -86,7 +87,7 @@ STEP 6 - Make a backup of your badge (strongly recommended)
   Why: if anything goes wrong, you can put your badge back exactly as it was.
 
   The backup is read in 16 small pieces because long USB transfers can break off
-  halfway. Run this command 16 times, counting the number up each time:
+  halfway. Run this command 16 times, counting up each time:
 
     esptool --chip esp32c5 -p COMx -b 230400 read-flash 0x0 0x100000 part00.bin
 
@@ -109,30 +110,48 @@ STEP 7 - Put the new firmware on the badge
   This replaces the operating system and keeps your Wi-Fi, badge ID and store apps.
   Every part should report "Hash of data verified". The badge restarts by itself.
 
+  Updating later (when the code changes): run step 2, then in D:\solana-os-gbemu
 
-STEP 8 - Copy a game onto the badge
+    git pull
+
+    idf.py -p COMx -b 230400 app-flash
+
+
+STEP 8 - Copy games onto the badge
   Why: the badge's USB port isn't a USB stick, so Windows can't show the memory
-  card. This little tool sends the file over the cable instead. If you have a card
-  reader, you can also just copy the file into a "roms" folder on the card.
+  card. This little tool sends a file over the cable instead. If you have a card
+  reader, you can also just copy the files into the folders from the table above.
 
-    python tools\sd_put.py --port COMx "C:\path\to\game.gb" roms/game.gb
+  Pick the folder that matches the console:
+
+    python tools\sd_put.py --port COMx "C:\path\to\game.gb" roms/gb/game.gb
+
+    python tools\sd_put.py --port COMx "C:\path\to\game.gbc" roms/gbc/game.gbc
+
+    python tools\sd_put.py --port COMx "C:\path\to\game.nes" roms/nes/game.nes
 
   Tip: type the command up to --port COMx, then drag the game file into the
-  window. Windows fills in its path. Then type roms/game.gb and press Enter.
-  The name after roms/ may only use letters, numbers and . _ -
+  window. Windows fills in its path. Then type the folder and name, and press Enter.
+  The name on the card may only use letters, numbers and . _ - /
   It's done when it says "done: ... SHA-256 checked". About 2 minutes per 1 MB.
 
 
 STEP 9 - Play
-  On the badge: open the app list, choose "Game Boy", pick your game, press SELECT.
+  On the badge: open the app list, choose "Retro", choose the console (the list
+  shows how many games each one has), choose the game, press SELECT.
+  CANCEL goes back from the game list to the consoles.
 
-  Controls:
-    Arrow buttons          = Game Boy arrows
-    SELECT                 = A
-    CANCEL                 = B
-    UP and DOWN together   = START
-    LEFT and RIGHT together= SELECT
-    BOOT (on the back)     = quit (your game is saved)
+  Controls while playing:
+    Arrow buttons            = arrows
+    SELECT                   = A
+    CANCEL                   = B
+    UP and DOWN together     = START
+    LEFT and RIGHT together  = SELECT
+    BOOT (on the back)       = quit
+
+  Saving: Game Boy games save the way they always did (in the game's own menu),
+  into a .sav file next to the game. NES games are frozen when you press BOOT and
+  continue from that exact moment next time (a .state file next to the game).
 
 
 PUT THE BADGE BACK THE WAY IT WAS
@@ -151,22 +170,24 @@ SOMETHING WENT WRONG?
   "Possible serial noise"
       The USB transfer broke off. Run the same command again. A shorter cable or
       a USB port directly on the PC also helps.
-  The game isn't in the list
-      The file has to end in .gb and be in the roms folder.
+  "No games in /roms/... on the card"
+      The file isn't in that console's folder, or has the wrong ending.
+  "Not an NES game this emulator can run"
+      Most NES games work, but some use special chips the NES part doesn't know.
 
 
-ADVANCED: ADD THE APP TO YOUR OWN SOLANA OS COPY
+ADVANCED: ADD RETRO TO YOUR OWN SOLANA OS COPY
   If you already have the solana-os code and only want the app (use this instead
   of step 3):
   1. Copy these from this repo into your solana-os folder:
-       main/apps/gbemu/        the app and its Game Boy core
+       main/apps/gbemu/        the app, the Game Boy core and the NES core (nes/)
        main/lua/lua_cmd.c      adds the "sdrecv" command that step 8 uses
        tools/sd_put.py         the upload tool from step 8
      If your solana-os is newer than 2.1.0, don't overwrite lua_cmd.c. Copy only
      the sdrecv part into it (see docs/GBEMU_TUTORIAL.md).
   2. Tell the build about the app. In main/sources.cmake, add this line after
      apps/apps/apps_app.c:
-       apps/gbemu/gbemu_app.c
+       apps/gbemu/gbemu_app.c apps/gbemu/nes/agnes_build.c
   3. Put the app in the launcher. In main/apps/registry.c, add app_gbemu at the
      end of the "extern const os_app_t ..." line, and add this line after
      &app_apps, :
