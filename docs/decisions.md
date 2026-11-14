@@ -62,3 +62,10 @@ Options: USB mass storage (the C5 has no USB OTG, the port is serial); a new pro
 Decision: `sdrecv <path> <bytes> <sha256>` in main/lua/lua_cmd.c, reusing recv_stream() (refactored out of lua recv in its own commit). Path relative to /sdcard, [A-Za-z0-9._-/], no "..", max 8 MB; written to <path>.put, renamed over the old file only after size and SHA-256 match.
 Evidence: VERIFIED on the badge (COM5): 40,000-byte random file -> "done: test/sdput_test.bin, 40000 bytes, SHA-256 checked, 5 s"; wrong-SHA negative test -> "recv: error the SHA-256 doesn't match", and `ls test` lists only sdput_test.bin (no .put or badsha.bin left behind).
 Revert: remove cmd_sdrecv and its registration, tools/sd_put.py.
+
+### DEC-2026-11-14-10: Share as an open-source sideload repo, no PR to solana-os
+Context: Fabian Schuh (Solana OS) in chat: "For C apps I would just have them in an open source GitHub repository and people can add it themselves to side load" and "I wouldn't do it as PR into Solana OS though".
+Options: PR upstream; App Store (Lua only, ruled out in DEC-08 notes and docs/GBEMU_TUTORIAL.md section 11); open-source fork people build themselves.
+Decision: Fork KiriKev/solana-os-gbemu with feat/gbemu-app as the default branch, a README banner, GBEMU_SETUP.txt (beginner steps with the reason for each, plus how to add the app to an existing checkout) and docs/GBEMU_TUTORIAL.md.
+Evidence: REPORTED (chat message relayed by Kev 2026-11-14).
+Revert: set main back as the default branch; remove the banner and the two docs.

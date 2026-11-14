@@ -1,5 +1,9 @@
 # Solana OS
 
+> **This fork adds a Game Boy emulator app** (branch `feat/gbemu-app`). No games included.
+> Beginner setup: [GBEMU_SETUP.txt](GBEMU_SETUP.txt). How it was built: [docs/GBEMU_TUTORIAL.md](docs/GBEMU_TUTORIAL.md).
+> The rest of this README is the original Solana OS one.
+
 Firmware for the Solana Breakpoint 2026 conference badge (ESP32-C5, ILI9341
 320x240, microSD, 6 buttons, 8 WS2812s): an app launcher, Wi-Fi (2.4 and 5 GHz), an
 ESP-NOW badge-to-badge mesh, Bluetooth LE for apps, the *Hitchhiker's Guide to Solana*

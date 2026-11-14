@@ -1,0 +1,174 @@
+GAME BOY EMULATOR FOR THE SOLANA OS BADGE
+Step-by-step setup for beginners (Windows)
+
+WHAT THIS IS
+  This adds a "Game Boy" app to your Breakpoint 2026 badge. You copy a Game Boy
+  game file (a ".gb" file) onto the badge's memory card, open the app, and play.
+
+  No games are included. Use a game you copied from your own cartridge, or a free
+  homebrew game that its makers share online.
+
+  Original Game Boy games only (.gb), shown in shades of green. Game Boy Color
+  games that also run on the original Game Boy work, in green. Games made only for
+  the Game Boy Color don't start, and NES games aren't supported.
+
+WHY IT TAKES A FEW STEPS
+  Apps in the badge's App Store are small Lua scripts. Lua is too slow to pretend
+  to be a whole Game Boy, so this app is written in C and built into the badge's
+  operating system (Solana OS). That means you build your own copy of Solana OS
+  with the app inside, and put it on the badge. It takes 30-60 minutes the first
+  time, mostly waiting for downloads.
+
+WHAT YOU NEED
+  - The badge, with a microSD card in it
+  - A USB cable that carries data (some cables only charge)
+  - A Windows PC with internet
+  - Git (https://git-scm.com) and Python 3 (https://www.python.org) installed.
+    Git downloads code, and Python runs the badge tools.
+
+HOW TO TYPE THE COMMANDS
+  Open the Start menu, type "PowerShell" and open "Windows PowerShell".
+  Copy one command at a time, paste it into the window (right-click), press Enter,
+  and wait until it finishes before the next one. The lines below that start with
+  spaces are commands; everything else is explanation.
+
+
+STEP 1 - Install the badge's build tools (once)
+  Why: the badge has an Espressif chip. Espressif's free toolkit, ESP-IDF, turns
+  the code into something the chip can run and sends it over USB. Solana OS needs
+  exactly version 6.0.1.
+
+    git clone -b v6.0.1 --recursive --depth 1 --shallow-submodules https://github.com/espressif/esp-idf.git D:\esp\esp-idf
+
+    $env:IDF_TOOLS_PATH='D:\esp\.espressif'; D:\esp\esp-idf\install.ps1 esp32c5
+
+  This downloads about 1-2 GB. It's done when it says "All done!".
+  Use PowerShell for this, not "Git Bash": the installer refuses to run there.
+  (D:\esp is just a folder with space. Use C:\esp in both lines if you have no D: drive.)
+
+
+STEP 2 - Turn the tools on
+  Why: Windows doesn't know where the tools are until you tell it. Do this every
+  time you open a new PowerShell window.
+
+    $env:IDF_TOOLS_PATH='D:\esp\.espressif'; . D:\esp\esp-idf\export.ps1
+
+
+STEP 3 - Download the code with the Game Boy app
+
+    git clone -b feat/gbemu-app https://github.com/KiriKev/solana-os-gbemu.git D:\solana-os-gbemu
+
+    cd D:\solana-os-gbemu
+
+
+STEP 4 - Build it
+  Why: this turns the code into the firmware file for your badge. The first time,
+  it also downloads the parts for the screen. It takes a few minutes.
+
+    idf.py set-target esp32c5
+
+    idf.py build
+
+  It worked when the last lines say "Project build complete".
+
+
+STEP 5 - Connect the badge and find its port
+  Why: the badge talks to the PC through a USB "COM port", and the tools need to
+  know which number it got.
+
+  Plug the badge in. Right-click the Start button, open "Device Manager", then
+  "Ports (COM & LPT)". Look for "USB-SERIAL CH340 (COM5)". The number may be
+  different on your PC. In the commands below, replace COMx with yours, e.g. COM5.
+  If nothing shows up, try another cable: yours may only charge.
+
+
+STEP 6 - Make a backup of your badge (strongly recommended)
+  Why: if anything goes wrong, you can put your badge back exactly as it was.
+
+  The backup is read in 16 small pieces because long USB transfers can break off
+  halfway. Run this command 16 times, counting the number up each time:
+
+    esptool --chip esp32c5 -p COMx -b 230400 read-flash 0x0 0x100000 part00.bin
+
+    (2nd time: 0x100000 ... part01.bin, 3rd: 0x200000 ... part02.bin,
+     up to 16th: 0xF00000 ... part15.bin)
+
+  Then join the 16 pieces into one file:
+
+    cmd /c copy /b part00.bin+part01.bin+part02.bin+part03.bin+part04.bin+part05.bin+part06.bin+part07.bin+part08.bin+part09.bin+part10.bin+part11.bin+part12.bin+part13.bin+part14.bin+part15.bin badge-backup.bin
+
+  badge-backup.bin should be exactly 16,777,216 bytes. Keep it private: it holds
+  your badge's identity and keys. The badge screen goes black while this runs.
+  That's normal, and it comes back when the badge restarts.
+
+
+STEP 7 - Put the new firmware on the badge
+
+    idf.py -p COMx -b 230400 flash
+
+  This replaces the operating system and keeps your Wi-Fi, badge ID and store apps.
+  Every part should report "Hash of data verified". The badge restarts by itself.
+
+
+STEP 8 - Copy a game onto the badge
+  Why: the badge's USB port isn't a USB stick, so Windows can't show the memory
+  card. This little tool sends the file over the cable instead. If you have a card
+  reader, you can also just copy the file into a "roms" folder on the card.
+
+    python tools\sd_put.py --port COMx "C:\path\to\game.gb" roms/game.gb
+
+  Tip: type the command up to --port COMx, then drag the game file into the
+  window. Windows fills in its path. Then type roms/game.gb and press Enter.
+  The name after roms/ may only use letters, numbers and . _ -
+  It's done when it says "done: ... SHA-256 checked". About 2 minutes per 1 MB.
+
+
+STEP 9 - Play
+  On the badge: open the app list, choose "Game Boy", pick your game, press SELECT.
+
+  Controls:
+    Arrow buttons          = Game Boy arrows
+    SELECT                 = A
+    CANCEL                 = B
+    UP and DOWN together   = START
+    LEFT and RIGHT together= SELECT
+    BOOT (on the back)     = quit (your game is saved)
+
+
+PUT THE BADGE BACK THE WAY IT WAS
+  Run step 2 first, then:
+
+    esptool --chip esp32c5 -p COMx -b 230400 write-flash 0 badge-backup.bin
+
+
+SOMETHING WENT WRONG?
+  "The syntax of the file name ... is incorrect"
+      You're in the old black "Command Prompt" window. Open PowerShell instead.
+  "MSys/Mingw is not supported"
+      You're in Git Bash. Open PowerShell instead.
+  "Could not open COMx"
+      Wrong port number or the badge is unplugged. Check step 5 again.
+  "Possible serial noise"
+      The USB transfer broke off. Run the same command again. A shorter cable or
+      a USB port directly on the PC also helps.
+  The game isn't in the list
+      The file has to end in .gb and be in the roms folder.
+
+
+ADVANCED: ADD THE APP TO YOUR OWN SOLANA OS COPY
+  If you already have the solana-os code and only want the app (use this instead
+  of step 3):
+  1. Copy these from this repo into your solana-os folder:
+       main/apps/gbemu/        the app and its Game Boy core
+       main/lua/lua_cmd.c      adds the "sdrecv" command that step 8 uses
+       tools/sd_put.py         the upload tool from step 8
+     If your solana-os is newer than 2.1.0, don't overwrite lua_cmd.c. Copy only
+     the sdrecv part into it (see docs/GBEMU_TUTORIAL.md).
+  2. Tell the build about the app. In main/sources.cmake, add this line after
+     apps/apps/apps_app.c:
+       apps/gbemu/gbemu_app.c
+  3. Put the app in the launcher. In main/apps/registry.c, add app_gbemu at the
+     end of the "extern const os_app_t ..." line, and add this line after
+     &app_apps, :
+       &app_gbemu,
+  4. Continue with step 4.
