@@ -11,7 +11,9 @@ A built-in C app that plays a `.gb` ROM from the microSD card. No ROM is include
 
 ## Use
 
-1. Copy a ROM to the card: `/roms/<name>.gb` (or the card root).
+1. Copy a ROM to the card: `/roms/<name>.gb` (or the card root). Without a card reader,
+   over the USB cable: `python tools/sd_put.py --port COM5 <file>.gb roms/<name>.gb`
+   (ESP-IDF's Python has pyserial; about 8 KB/s, so a 1 MB file takes about 2 minutes).
 2. Open **Game Boy** in the launcher, pick the ROM, press SELECT.
 3. Controls: d-pad = d-pad, SELECT = A, CANCEL = B, UP+DOWN = START, LEFT+RIGHT = SELECT.
    BOOT (back of the badge) quits. The save is written to `<name>.sav` on quit and

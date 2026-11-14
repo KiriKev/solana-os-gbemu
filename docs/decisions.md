@@ -55,3 +55,10 @@ Options: install Emscripten now (another download, needs Kev's yes); ship with t
 Decision: Badge build only. gbemu_app.c is in SOLANA_OS_SRCS, so the emulator build compiles it too, but that is not verified.
 Evidence: VERIFIED `idf.py build` (ESP-IDF v6.0.1): "Project build complete", solana_os.bin 0x2412d0 bytes, 44% of the app partition free. The gate can fail: the first two builds failed on gbemu_app.c (implicit lvgl_port_lock; -Werror=format-truncation), both fixed.
 Revert: n/a
+
+### DEC-2026-11-14-09: sdrecv console command + tools/sd_put.py for files without a card reader
+Context: Kev has no card reader; the badge's USB is a CH340 serial port, so the card is not a USB drive.
+Options: USB mass storage (the C5 has no USB OTG, the port is serial); a new protocol; reuse lua recv's block protocol.
+Decision: `sdrecv <path> <bytes> <sha256>` in main/lua/lua_cmd.c, reusing recv_stream() (refactored out of lua recv in its own commit). Path relative to /sdcard, [A-Za-z0-9._-/], no "..", max 8 MB; written to <path>.put, renamed over the old file only after size and SHA-256 match.
+Evidence: VERIFIED on the badge (COM5): 40,000-byte random file -> "done: test/sdput_test.bin, 40000 bytes, SHA-256 checked, 5 s"; wrong-SHA negative test -> "recv: error the SHA-256 doesn't match", and `ls test` lists only sdput_test.bin (no .put or badsha.bin left behind).
+Revert: remove cmd_sdrecv and its registration, tools/sd_put.py.
