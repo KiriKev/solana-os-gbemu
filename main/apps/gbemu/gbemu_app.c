@@ -375,7 +375,9 @@ static void emu_task(void *arg)
     const int64_t frame_us = nes ? NES_FRAME_US : GB_FRAME_US;
     int64_t next = esp_timer_get_time(), last_save = next, stat_t = next;
     int frames = 0, shown = 0, late = 0;
+    int64_t busy_sum = 0, busy_max = 0;     // time spent emulating and drawing, the core's real cost
     while (!s_quit) {
+        int64_t t0 = esp_timer_get_time();
         uint8_t held = buttons();
         if (nes) {
             nes_input(e, held);
@@ -387,6 +389,9 @@ static void emu_task(void *arg)
             e->gb.direct.joypad = (uint8_t)~held;   // Walnut-CGB: 0 = pressed
             gb_run_frame(&e->gb);
         }
+        int64_t busy = esp_timer_get_time() - t0;
+        busy_sum += busy;
+        busy_max = busy > busy_max ? busy : busy_max;
         if (e->drawn) {
             e->drawn = false;
             shown += present(e);
@@ -405,10 +410,13 @@ static void emu_task(void *arg)
         frames++;
         if (now - stat_t >= 5000000) {      // speed check on the console
             double s = (now - stat_t) / 1e6;
-            ESP_LOGI(TAG, "%s: %.1f emulated fps (target %.1f), %.1f shown, %d resyncs", SYSTEMS[e->sys].name,
-                     frames / s, 1e6 / frame_us, shown / s, late);
+            ESP_LOGI(TAG, "%s: %.1f emulated fps (target %.1f), %.1f shown, %d resyncs; "
+                     "emulate+draw %.2f ms/frame avg, %.2f max (budget %.2f)", SYSTEMS[e->sys].name,
+                     frames / s, 1e6 / frame_us, shown / s, late,
+                     busy_sum / 1000.0 / frames, busy_max / 1000.0, frame_us / 1000.0);
             stat_t = now;
             frames = shown = late = 0;
+            busy_sum = busy_max = 0;
         }
         if (!nes && e->ram_dirty && now - last_save >= SAVE_EVERY_US) {
             save(e);
