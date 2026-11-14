@@ -8,3 +8,8 @@ idf_component_register(
 
 # cJSON (espressif/cjson) parses mesh JSON with a depth cap of 16:
 # CONFIG_CJSON_NESTING_LIMIT in sdkconfig.defaults.
+
+# The Retro emulator cores run every cycle of a game console: speed over size
+# for these two files (the rest of the firmware stays -Os, sdkconfig.defaults).
+set_source_files_properties(apps/gbemu/gbemu_app.c apps/gbemu/nes/agnes_build.c
+                            PROPERTIES COMPILE_OPTIONS "-O2")

@@ -76,3 +76,10 @@ Options: Retro-Go (GPL, replaces Solana OS, no ESP32-C5 target); two MIT cores i
 Decision: Walnut-CGB a42c1869 replaces Peanut-GB (deletion in its own commit), agnes 0e4220b0 for NES via nes/agnes_build.c (-Wtype-limits off, vendored file unchanged), `struct gb_s;` forward declaration for walnut_cgb.h's prototypes. Folders roms/gb (+ legacy roms/), roms/gbc, roms/nes. App id "retro", name "Retro"; folder and symbol names stay gbemu to keep the diff small. NES picture 256x218 (11 rows cut top and bottom), NES saves as an agnes state on quit.
 Evidence: VERIFIED `idf.py build`: Project build complete, solana_os.bin 0x245ca0 bytes, 43% free; flashed to the badge on COM5 ("Hash of data verified"); badge console `apps` lists "retro    Retro" and `open retro` logs "os: app: retro". NOT VERIFIED: a GBC or NES game running on the badge, and the fps of either.
 Revert: git revert of this commit, then the Peanut-GB deletion commit.
+
+### DEC-2026-11-14-12: -O2 for the two Retro emulator files
+Context: Game Boy ran 20-28 of 59.7 fps, 19-29 ms emulate+draw per frame (budget 16.74), NES about 5 fps (165-190 ms). The firmware builds with -Os.
+Options: leave -Os; -O2 for the whole firmware (bigger binary, untested elsewhere); -O2 for gbemu_app.c and agnes_build.c only.
+Decision: per-file -O2 in main/CMakeLists.txt (badge build only; the browser emulator has its own flags). Verified in the verbose build that -O2 comes after -Os on the compile line, so it wins.
+Evidence: VERIFIED badge console with a Game Boy Color-enhanced 1 MB game (colour mode, core state 50420 B in SRAM): after the change 24-29.5 fps, 15.9-25.5 ms/frame, vs 19.6-27.8 fps, 19-29 ms before. About 10-20 % faster; the emulation alone still takes about the whole frame budget, and per frame ~35 ms pass in total, so display and OS take about as long again.
+Revert: remove the set_source_files_properties block from main/CMakeLists.txt.

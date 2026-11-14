@@ -532,9 +532,12 @@ static void start(sys_t sys, const char *path)
     bool nes = SYSTEMS[sys].nes;
     // The Game Boy core's state is touched every cycle: SRAM when the badge can spare it.
     emu_t *e = NULL;
-    if (!nes && heap_caps_get_free_size(OS_MEM_SRAM_MALLOC) > sizeof(*e) + SRAM_KEEP) {
+    size_t sram_free = heap_caps_get_free_size(OS_MEM_SRAM_MALLOC);
+    if (!nes && sram_free > sizeof(*e) + SRAM_KEEP) {
         e = heap_caps_calloc(1, sizeof(*e), OS_MEM_SRAM);
     }
+    ESP_LOGI(TAG, "core state %u B in %s (SRAM free %u B)", (unsigned)sizeof(*e), e ? "SRAM" : "PSRAM",
+             (unsigned)sram_free);
     if (!e) {
         e = heap_caps_calloc(1, sizeof(*e), os_mem_bulk_caps());
     }
