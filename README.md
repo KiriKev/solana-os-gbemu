@@ -1,6 +1,7 @@
 # Solana OS
 
 > **This fork adds Retro, a Game Boy / Game Boy Color / NES emulator app** (branch `feat/gbemu-app`). No games included.
+> **Install from the browser (Chrome or Edge): [solana-os-gbemu.vercel.app](https://solana-os-gbemu.vercel.app)**: back up the badge, install Retro, copy your games.
 > Beginner setup: [GBEMU_SETUP.txt](GBEMU_SETUP.txt). How it was built: [docs/GBEMU_TUTORIAL.md](docs/GBEMU_TUTORIAL.md).
 > The rest of this README is the original Solana OS one.
 

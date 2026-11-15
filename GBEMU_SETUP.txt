@@ -13,6 +13,11 @@ WHAT THIS IS
   No games are included. Use games you copied from your own cartridges, or free
   homebrew games that their makers share online.
 
+EASIEST WAY: THE WEB PAGE (no building, about 5 minutes plus the backup)
+  Open https://solana-os-gbemu.vercel.app in Chrome or Edge on a computer, plug
+  in the badge and follow the four steps there: back up, install Retro, copy
+  your games, play. The rest of this guide is for building it yourself.
+
 WHY IT TAKES A FEW STEPS
   Apps in the badge's App Store are small Lua scripts. Lua is too slow to pretend
   to be a whole game console, and Lua apps can't read the games folder. So Retro is
