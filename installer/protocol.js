@@ -143,3 +143,41 @@ export async function sendFile(con, data, dest, onProgress) {
   }
 }
 
+
+// ---- Backup and restore ----
+
+export const FLASH_SIZE = 16 << 20;         // the badge's 16 MB flash
+export const BACKUP_CHUNK = 1 << 20;
+
+// A whole-badge backup: 16 MB, the bootloader image (0xE9) at 0x2000 and the
+// partition table (0xAA 0x50) at 0x8000, as on every badge.
+export function isBadgeBackup(data) {
+  return data.length === FLASH_SIZE && data[0x2000] === 0xe9 && data[0x8000] === 0xaa && data[0x8001] === 0x50;
+}
+
+// Reads the whole flash a chunk at a time. After each chunk the chip sends the
+// MD5 of what it read; a chunk that doesn't match, or fails, is read again
+// after a reconnect, up to `tries` times. Long reads over the badge's CH340
+// break off now and then, so one big read would rarely finish.
+// session: { readFlash(addr, n, onBytes), readDigest() -> Uint8Array(16), reconnect() }
+export async function readWholeFlash(session, md5, onProgress, { size = FLASH_SIZE, chunk = BACKUP_CHUNK, tries = 3 } = {}) {
+  const out = new Uint8Array(size);
+  for (let addr = 0; addr < size; addr += chunk) {
+    const n = Math.min(chunk, size - addr);
+    for (let attempt = 1; ; attempt++) {
+      try {
+        const data = await session.readFlash(addr, n, (got) => onProgress((addr + got) / size));
+        const digest = await session.readDigest();
+        const want = Array.from(digest || [], (b) => b.toString(16).padStart(2, "0")).join("");
+        if (data.length !== n || md5(data) !== want) throw new Error(`checksum mismatch at 0x${addr.toString(16)}`);
+        out.set(data, addr);
+        break;
+      } catch (e) {
+        if (attempt >= tries) throw new Error(`Reading 0x${addr.toString(16)} failed ${tries} times: ${e.message || e}`);
+        await session.reconnect();
+      }
+    }
+  }
+  onProgress(1);
+  return out;
+}

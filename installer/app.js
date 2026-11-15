@@ -8,7 +8,7 @@
 
 import { ESPLoader, Transport } from "https://cdn.jsdelivr.net/npm/esptool-js@0.7.0/+esm";
 import { md5 } from "./md5.js";
-import { planFiles, BadgeConsole, sendFile } from "./protocol.js";
+import { planFiles, BadgeConsole, sendFile, isBadgeBackup, readWholeFlash } from "./protocol.js";
 
 const CH340 = { usbVendorId: 0x1a86 };      // the badge's USB-serial chip
 const FLASH_BAUD = 230400;                  // faster rates drop bytes on the CH340 (measured)
@@ -40,13 +40,123 @@ function setBusy(on) {
   $("copy").disabled = on || !planned.length || !("serial" in navigator);
 }
 
-// ---- Step 1: install ----
+// The chip's ROM loader on `port`: checks it's the badge's ESP32-C5.
+async function connect(port) {
+  const transport = new Transport(port, false);
+  const loader = new ESPLoader({
+    transport,
+    baudrate: FLASH_BAUD,
+    romBaudrate: 115200,
+    terminal: { clean() {}, writeLine: log, write: (s) => log(s) },
+  });
+  try {
+    const chip = await loader.main();
+    if (!/ESP32-C5/i.test(chip)) throw new Error(`That's a ${chip}, not the badge's ESP32-C5. Nothing was changed.`);
+  } catch (e) {
+    await transport.disconnect().catch(() => {});
+    throw e;
+  }
+  return { transport, loader };
+}
+
+function failed(statusId, what, e) {
+  const cancelled = e && e.name === "NotFoundError";
+  setStatus(statusId, cancelled ? "No badge picked." : `${what} failed: ` + (e.message || e), cancelled ? "" : "error");
+  if (!cancelled) log(String(e && e.stack || e));
+}
+
+// ---- Back up the whole badge ----
+
+async function backup() {
+  setBusy(true);
+  setProgress("backup-progress", null);
+  let link;
+  try {
+    setStatus("backup-status", "Pick your badge in the list (USB-SERIAL CH340)…");
+    const port = await navigator.serial.requestPort({ filters: [CH340] });
+    setStatus("backup-status", "Connecting… (the badge screen goes dark, that's normal)");
+    link = await connect(port);
+    setStatus("backup-status", "Reading all 16 MB… about 10-15 minutes, keep it plugged in");
+    setProgress("backup-progress", 0);
+    const session = {
+      readFlash: (addr, n, onBytes) => link.loader.readFlash(addr, n, (_, got) => onBytes(got)),
+      readDigest: () => link.loader.transport.read(3000),     // the MD5 the chip sends after each read
+      reconnect: async () => {
+        log("read broke off, reconnecting…");
+        await link.transport.disconnect().catch(() => {});
+        link = await connect(port);
+      },
+    };
+    const image = await readWholeFlash(session, md5, (f) => setProgress("backup-progress", f));
+    if (!isBadgeBackup(image)) throw new Error("What came back doesn't look like a badge (no bootloader or partition table).");
+    await link.loader.after("hard_reset");
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([image], { type: "application/octet-stream" }));
+    a.download = `badge-backup-${new Date().toISOString().slice(0, 10)}.bin`;
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setStatus("backup-status", `Done: ${a.download} (16 MB) is in your downloads. Keep it private: it holds your badge's identity and keys.`, "ok");
+  } catch (e) {
+    failed("backup-status", "Backup", e);
+  } finally {
+    if (link) await link.transport.disconnect().catch(() => {});
+    setBusy(false);
+  }
+}
+
+// ---- Restore a backup ----
+
+async function restore(input) {
+  const file = input.files[0];
+  input.value = "";
+  if (!file) return;
+  const image = new Uint8Array(await file.arrayBuffer());
+  if (!isBadgeBackup(image)) {
+    setStatus("restore-status", `${file.name} isn't a badge backup (it must be the 16 MB file from "Back up badge").`, "error");
+    return;
+  }
+  if (!confirm(`Put the badge back exactly as it was in ${file.name}?\n\nEverything on the badge is replaced by the backup: the operating system, apps, settings and badge identity. Games on the microSD card stay.`)) {
+    return;
+  }
+  setBusy(true);
+  setProgress("restore-progress", null);
+  let link;
+  try {
+    setStatus("restore-status", "Pick your badge in the list (USB-SERIAL CH340)…");
+    const port = await navigator.serial.requestPort({ filters: [CH340] });
+    setStatus("restore-status", "Connecting… (the badge screen goes dark, that's normal)");
+    link = await connect(port);
+    setStatus("restore-status", "Writing the backup… a few minutes, keep it plugged in");
+    setProgress("restore-progress", 0);
+    await link.loader.writeFlash({
+      fileArray: [{ address: 0, data: image }],
+      flashMode: "keep",
+      flashFreq: "keep",
+      flashSize: "keep",
+      eraseAll: false,
+      compress: true,
+      reportProgress: (_, written) => setProgress("restore-progress", written / image.length),
+      calculateMD5Hash: md5,
+    });
+    await link.loader.after("hard_reset");
+    setProgress("restore-progress", 1);
+    setStatus("restore-status", "Done: the badge is back to how it was in the backup. It's restarting now.", "ok");
+  } catch (e) {
+    failed("restore-status", "Restore", e);
+  } finally {
+    if (link) await link.transport.disconnect().catch(() => {});
+    setBusy(false);
+  }
+}
+
+// ---- Install ----
 
 async function install() {
   setBusy(true);
   setStatus("install-status", "Loading the firmware…");
   setProgress("install-progress", null);
-  let transport;
+  let link;
   try {
     const fw = await (await fetch("firmware/firmware.json", { cache: "no-store" })).json();
     const files = [];
@@ -57,16 +167,9 @@ async function install() {
     }
     setStatus("install-status", "Pick your badge in the list (USB-SERIAL CH340)…");
     const port = await navigator.serial.requestPort({ filters: [CH340] });
-    transport = new Transport(port, false);
-    const loader = new ESPLoader({
-      transport,
-      baudrate: FLASH_BAUD,
-      romBaudrate: 115200,
-      terminal: { clean() {}, writeLine: log, write: (s) => log(s) },
-    });
     setStatus("install-status", "Connecting… (the badge screen goes dark, that's normal)");
-    const chip = await loader.main();
-    if (!/ESP32-C5/i.test(chip)) throw new Error(`That's a ${chip}, not the badge's ESP32-C5. Nothing was written.`);
+    link = await connect(port);
+    const { loader } = link;
     const total = files.reduce((n, f) => n + f.data.length, 0);
     const before = files.map((f, i) => files.slice(0, i).reduce((n, g) => n + g.data.length, 0));
     setStatus("install-status", "Writing Retro to the badge… keep it plugged in");
@@ -85,11 +188,9 @@ async function install() {
     setProgress("install-progress", 1);
     setStatus("install-status", `Done: Retro ${fw.version} is on your badge. It's restarting now.`, "ok");
   } catch (e) {
-    const cancelled = e && e.name === "NotFoundError";
-    setStatus("install-status", cancelled ? "No badge picked." : "Install failed: " + (e.message || e), cancelled ? "" : "error");
-    if (!cancelled) log(String(e && e.stack || e));
+    failed("install-status", "Install", e);
   } finally {
-    if (transport) await transport.disconnect().catch(() => {});
+    if (link) await link.transport.disconnect().catch(() => {});
     setBusy(false);
   }
 }
@@ -167,6 +268,8 @@ async function copyGames() {
 if (!("serial" in navigator)) {
   $("unsupported").hidden = false;
 }
+$("backup").addEventListener("click", backup);
+$("restore-file").addEventListener("change", (e) => restore(e.target));
 $("install").addEventListener("click", install);
 $("copy").addEventListener("click", copyGames);
 $("folder").addEventListener("change", (e) => pick(e.target));

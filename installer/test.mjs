@@ -4,7 +4,8 @@
 import { createHash } from "node:crypto";
 
 const mod = process.env.PROTOCOL_URL || new URL("./protocol.js", import.meta.url).href;
-const { planFiles, BadgeConsole, sendFile } = await import(mod);
+const { planFiles, BadgeConsole, sendFile, isBadgeBackup, readWholeFlash } = await import(mod);
+const { md5 } = await import(new URL("./md5.js", import.meta.url).href);
 
 let failed = 0, passed = 0;
 function check(name, ok, detail = "") {
@@ -120,6 +121,58 @@ for (const size of [0, 1, 1535, 1536, 1537, 40976, 1048576]) {
 {
   const r = await send({ corrupt: true }, 5000);
   check("badge rejects", !r.ok && /SHA-256 doesn't match/.test(r.err), r.err);
+}
+
+// ---- backup / restore ----
+{
+  const size = 16 << 20;
+  const good = new Uint8Array(size);
+  good[0x2000] = 0xe9; good[0x8000] = 0xaa; good[0x8001] = 0x50;
+  check("backup ok", isBadgeBackup(good));
+  check("backup wrong size", !isBadgeBackup(good.subarray(0, size - 1)));
+  const noPt = good.slice(); noPt[0x8001] = 0;
+  check("backup no partition table", !isBadgeBackup(noPt));
+  const noBoot = good.slice(); noBoot[0x2000] = 0xff;
+  check("backup no bootloader", !isBadgeBackup(noBoot));
+}
+
+// A fake flash session: `faults` lists reads that go wrong (by call number):
+// "throw" (the link breaks off) or "corrupt" (a flipped bit, so the MD5 differs).
+function fakeFlash(flash, faults = {}) {
+  let call = 0, last = null, reconnects = 0;
+  return {
+    get reconnects() { return reconnects; },
+    async readFlash(addr, n, onBytes) {
+      const fault = faults[++call];
+      if (fault === "throw") throw new Error("Timeout");
+      const data = flash.slice(addr, addr + n);
+      last = md5(data);
+      if (fault === "corrupt") data[n >> 1] ^= 0x40;
+      for (let got = 4096; got <= n; got += 4096) onBytes(got);
+      return data;
+    },
+    async readDigest() { return Uint8Array.from(last.match(/../g), (h) => parseInt(h, 16)); },
+    async reconnect() { reconnects++; },
+  };
+}
+{
+  const size = 4 << 20, chunk = 1 << 20;
+  const flash = new Uint8Array(size);
+  for (let i = 0; i < size; i++) flash[i] = (i * 2654435761) >>> 24;
+  const opts = { size, chunk };
+  let p = 0;
+  const clean = await readWholeFlash(fakeFlash(flash), md5, (x) => { p = x; }, opts);
+  check("read whole flash", Buffer.compare(Buffer.from(clean), Buffer.from(flash)) === 0);
+  check("read progress", p === 1, String(p));
+  const s2 = fakeFlash(flash, { 2: "throw", 4: "corrupt" });
+  let retried = null, rerr = "";
+  try { retried = await readWholeFlash(s2, md5, () => {}, opts); } catch (e) { rerr = String(e.message); }
+  check("read retries", retried && Buffer.compare(Buffer.from(retried), Buffer.from(flash)) === 0 && s2.reconnects === 2,
+        rerr || String(s2.reconnects));
+  let err = "";
+  try { await readWholeFlash(fakeFlash(flash, { 1: "corrupt", 2: "corrupt", 3: "corrupt" }), md5, () => {}, opts); }
+  catch (e) { err = String(e.message); }
+  check("read gives up", /failed 3 times.*checksum mismatch/.test(err), err);
 }
 
 console.log(`${passed} passed, ${failed} failed`);

@@ -68,7 +68,16 @@
   </div>
 
   <div class="card">
-    <span class="step">Step 1</span>
+    <span class="step">Step 1 (recommended)</span>
+    <h2>Back up your badge</h2>
+    <p>Saves everything on your badge (system, apps, settings, badge identity) as one 16 MB file on your computer, so you can go back to exactly this state later. Takes about 10-15 minutes.</p>
+    <div class="row"><button class="primary" id="backup">Back up badge</button></div>
+    <progress id="backup-progress" max="1000" value="0" hidden></progress>
+    <div class="status" id="backup-status" role="status"></div>
+  </div>
+
+  <div class="card">
+    <span class="step">Step 2</span>
     <h2>Install Retro</h2>
     <p>Plug in the badge, click the button and pick <strong>USB-SERIAL CH340</strong>. Your badge keeps its Wi-Fi, badge ID and store apps. Only the operating system is updated.</p>
     <div class="row"><button class="primary" id="install">Install Retro</button></div>
@@ -77,7 +86,7 @@
   </div>
 
   <div class="card">
-    <span class="step">Step 2</span>
+    <span class="step">Step 3</span>
     <h2>Copy your games</h2>
     <p>Make a folder on your computer like this, with your games inside:</p>
     <pre class="tree">roms/
@@ -96,7 +105,7 @@
   </div>
 
   <div class="card">
-    <span class="step">Step 3</span>
+    <span class="step">Step 4</span>
     <h2>Play</h2>
     <p>On the badge: open <strong>Retro</strong>, pick the console, pick the game, press SELECT.</p>
     <ul>
@@ -105,6 +114,14 @@
       <li>BOOT (on the back) = quit. Your game is saved.</li>
     </ul>
     <p>Early test build: Game Boy and Game Boy Color run at about half speed, NES is very slow.</p>
+  </div>
+
+  <div class="card">
+    <h2>Go back to how it was</h2>
+    <p>Choose a backup file from step 1 to put the badge back exactly as it was then, including the original system. Games on the microSD card stay.</p>
+    <div class="row"><label class="filebtn">Restore backup<input type="file" id="restore-file" accept=".bin"></label></div>
+    <progress id="restore-progress" max="1000" value="0" hidden></progress>
+    <div class="status" id="restore-status" role="status"></div>
   </div>
 
   <details>
