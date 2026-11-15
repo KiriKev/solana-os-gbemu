@@ -25,20 +25,27 @@
 // game). BOOT (HOME) leaves the app. Saves: Game Boy cart RAM in <rom>.sav, on
 // quit and every minute while it changes; NES the whole machine in
 // <rom>.state, on quit, restored at the next start.
+//
+// Link cable (Game Boy and Game Boy Color): the console list's last row picks a
+// nearby badge; both players pick each other. The serial port's bytes then go
+// over the badge mesh (os_mesh APP messages) instead of a cable.
 
 #include <dirent.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_lvgl_port.h"                  // lvgl_port_lock/unlock, as core/os.c
 #include "lvgl_private.h"                   // lv_image_cache_drop, as core/os.c
 #include "core/os.h"
 #include "core/os_mem.h"
+#include "core/os_mesh.h"
 #include "core/ui.h"
 #include "nes/agnes.h"
 
@@ -95,9 +102,49 @@ typedef struct {
     bool drawn;                             // a whole frame reached the back buffer
     char rom_path[PATH_MAX_LEN];
     char sav_path[PATH_MAX_LEN];            // <rom>.sav or <rom>.state
+    // The task's own handles: if it ever outlives leave()'s wait, leave() forgets
+    // the globals without deleting these, so the task never touches freed ones.
+    QueueHandle_t link_q;                   // NULL = no cable
+    SemaphoreHandle_t done;
 } emu_t;
 
-typedef enum { VIEW_SYSTEMS, VIEW_GAMES, VIEW_PLAYING } view_t;
+typedef enum { VIEW_SYSTEMS, VIEW_GAMES, VIEW_LINK, VIEW_PLAYING } view_t;
+
+// Link cable over the badge mesh (Game Boy and Game Boy Color only).
+// The clocking side (internal clock) numbers its transfers and sends each byte
+// with its number n. The clocked side sends the byte it has ready, tagged with
+// the number of the transfer it answers (the last n it took, plus one), once,
+// and again every LINK_RESEND_MS while it waits, in case a frame got lost. The
+// clocking side takes only the answer to its current transfer, waiting up to
+// LINK_WAIT_MS; the clocked side takes the next byte the partner clocked.
+// Anything else is stale and dropped, so a lost or late byte costs one
+// transfer (the game sees "no cable" for it), never a lasting shift.
+#define LINK_APP        "retro-link"
+#define LINK_WAIT_MS    60
+#define LINK_RESEND_MS  200
+#define LINK_QUEUE      16
+#define LINK_PEERS_MAX  12
+#define MESH_PEERS_MAX  20                  // os_mesh.c's table
+#define ROW_LINK        SYS_COUNT           // the console list's last row
+
+typedef struct {
+    uint8_t b;
+    bool master;                            // the partner clocked this transfer
+    uint32_t n;                             // its transfer number, or the one it answers
+} link_byte_t;
+
+static char s_link_id[OS_MESH_ID_LEN + 1];  // partner badge, "" = no cable; kept while the badge runs
+static char s_link_name[25];
+static QueueHandle_t s_link_q;              // the mesh handler's; the emulator task uses emu_t.link_q
+static int s_link_sub = -1;
+static bool s_link_held;                    // os_mesh_acquire() taken
+static uint32_t s_link_seq;                 // clocking: number of the current transfer
+static uint32_t s_link_last;                // clocked: number of the last transfer taken
+static int s_link_sent = -1;                // clocked: byte already sent for the waiting transfer
+static uint32_t s_link_sent_n;
+static TickType_t s_link_sent_at;
+static os_mesh_peer_t s_peers[LINK_PEERS_MAX];
+static int s_peer_count, s_tick;
 
 static emu_t *s_emu;
 static TaskHandle_t s_task;
@@ -160,6 +207,89 @@ static void gb_err(struct gb_s *gb, const enum gb_error_e err, const uint16_t ad
     ESP_LOGE(TAG, "emulation error %d at 0x%04X", (int)err, addr);
     os_toast("Game Boy error %d at %04X", (int)err, addr);
     s_quit = true;
+}
+
+// ---- Link cable (mesh task and emulator task) ----
+
+// Mesh task: keep it short (os_mesh.h). Only the chosen partner's bytes count.
+static void link_heard(os_mesh_type_t type, const os_mesh_peer_t *from, const char *json, void *ctx)
+{
+    QueueHandle_t q = s_link_q;
+    if (!q || strcmp(from->id, s_link_id) || !strstr(json, "\"app\":\"" LINK_APP "\"")) {
+        return;
+    }
+    const char *b = strstr(json, "\"b\":"), *m = strstr(json, "\"m\":"), *n = strstr(json, "\"n\":");
+    if (!b || !m || !n) {
+        return;
+    }
+    link_byte_t v = {.b = (uint8_t)atoi(b + 4), .master = m[4] == '1', .n = (uint32_t)strtoul(n + 4, NULL, 10)};
+    if (xQueueSend(q, &v, 0) != pdTRUE) {   // full: drop the oldest, keep the newest
+        link_byte_t old;
+        xQueueReceive(q, &old, 0);
+        xQueueSend(q, &v, 0);
+    }
+}
+
+static void link_send(uint8_t b, bool master, uint32_t n)
+{
+    char msg[96];
+    snprintf(msg, sizeof(msg), "{\"app\":\"" LINK_APP "\",\"b\":%u,\"m\":%d,\"n\":%lu}", b, master, (unsigned long)n);
+    os_mesh_send(OS_MESH_APP, s_link_id, msg);  // fails while the partner is out of range: the game sees no cable
+}
+
+// Walnut-CGB calls this when a transfer starts, and on the clocked side again
+// every 4096 cycles while it waits: that side sends once per transfer (plus a
+// slow resend), not on every call.
+static void link_tx(struct gb_s *gb, const uint8_t b)
+{
+    if (gb->hram_io[IO_SC] & SERIAL_SC_CLOCK_SRC) {
+        link_send(b, true, ++s_link_seq);
+        return;
+    }
+    uint32_t n = s_link_last + 1;
+    TickType_t now = xTaskGetTickCount();
+    if (b == s_link_sent && n == s_link_sent_n && now - s_link_sent_at < pdMS_TO_TICKS(LINK_RESEND_MS)) {
+        return;
+    }
+    s_link_sent = b;
+    s_link_sent_n = n;
+    s_link_sent_at = now;
+    link_send(b, false, n);
+}
+
+static enum gb_serial_rx_ret_e link_rx(struct gb_s *gb, uint8_t *rx)
+{
+    emu_t *e = gb->direct.priv;
+    bool master = gb->hram_io[IO_SC] & SERIAL_SC_CLOCK_SRC;
+    TickType_t end = xTaskGetTickCount() + (master ? pdMS_TO_TICKS(LINK_WAIT_MS) : 0);
+    link_byte_t v;
+    for (;;) {
+        // Never wait once the app is closing: leave() is waiting for this task.
+        int32_t left = (int32_t)(end - xTaskGetTickCount());
+        if (xQueueReceive(e->link_q, &v, master && !s_quit && left > 0 ? left : 0) != pdTRUE) {
+            return GB_SERIAL_RX_NO_CONNECTION;
+        }
+        if (master && !v.master && v.n == s_link_seq) {
+            *rx = v.b;
+            return GB_SERIAL_RX_SUCCESS;
+        }
+        if (!master && v.master) {
+            s_link_last = v.n;
+            s_link_sent = -1;
+            *rx = v.b;
+            return GB_SERIAL_RX_SUCCESS;
+        }
+        // An answer to an earlier transfer, a copy, or both sides clocking or
+        // both waiting: nobody shifted it for this transfer, so it's dropped.
+    }
+}
+
+static void link_hold(bool on)
+{
+    if (on != s_link_held) {
+        on ? os_mesh_acquire() : os_mesh_release();
+        s_link_held = on;
+    }
 }
 
 // Line y of 144 into rows of the 240x216 back buffer: even lines fill two rows,
@@ -332,6 +462,9 @@ static bool start_gb(emu_t *e)
         e->ram_size = want;
     }
     gb_init_lcd(&e->gb, draw_line);
+    if (e->link_q) {
+        gb_init_serial(&e->gb, link_tx, link_rx);
+    }
     e->gb.direct.frame_skip = true;         // draw every other frame (~30 fps), emulate all 60
     char title[17];
     ESP_LOGI(TAG, "%s: %u KB ROM, %u B cart RAM, %s mode", gb_get_rom_name(&e->gb, title),
@@ -425,7 +558,7 @@ static void emu_task(void *arg)
     }
     save(e);
 out:
-    xSemaphoreGive(s_done);
+    xSemaphoreGive(e->done);
     vTaskDelete(NULL);
 }
 
@@ -472,7 +605,25 @@ static int scan(sys_t sys, bool list)
 
 static void row(int i, ui_row_t *r, void *ctx)
 {
-    if (s_view == VIEW_SYSTEMS) {
+    if (s_view == VIEW_SYSTEMS && i == ROW_LINK) {
+        snprintf(r->title, sizeof(r->title), "Link cable");
+        snprintf(r->sub, sizeof(r->sub), "%s%s", s_link_id[0] ? "With " : "Off: play with a nearby badge",
+                 s_link_id[0] ? (s_link_name[0] ? s_link_name : s_link_id) : "");
+        snprintf(r->right, sizeof(r->right), "Game Boy");
+        r->right_color = COL_DIM;
+    } else if (s_view == VIEW_LINK) {
+        if (i == 0) {
+            snprintf(r->title, sizeof(r->title), "No cable");
+            snprintf(r->sub, sizeof(r->sub), "Play alone");
+        } else {
+            const os_mesh_peer_t *p = &s_peers[i - 1];
+            snprintf(r->title, sizeof(r->title), "%s", p->name[0] ? p->name : p->id);
+            snprintf(r->sub, sizeof(r->sub), "Badge %s  " LV_SYMBOL_BULLET "  %d dBm", p->id, p->rssi);
+        }
+        if ((i == 0 && !s_link_id[0]) || (i > 0 && !strcmp(s_peers[i - 1].id, s_link_id))) {
+            snprintf(r->right, sizeof(r->right), LV_SYMBOL_OK);
+        }
+    } else if (s_view == VIEW_SYSTEMS) {
         snprintf(r->title, sizeof(r->title), "%s", SYSTEMS[i].name);
         snprintf(r->sub, sizeof(r->sub), "/%s", SYSTEMS[i].dirs[0]);
         snprintf(r->right, sizeof(r->right), "%d game%s", s_counts[i], s_counts[i] == 1 ? "" : "s");
@@ -498,9 +649,72 @@ static void show_systems(void)
     for (int i = 0; i < SYS_COUNT; i++) {
         s_counts[i] = scan(i, false);
     }
-    ui_list_set_count(s_list, SYS_COUNT);
+    ui_list_set_count(s_list, SYS_COUNT + 1);
     ui_list_select(s_list, s_sys);
     hint(LV_SYMBOL_UP LV_SYMBOL_DOWN " console   SELECT open   CANCEL exit");
+}
+
+// Nearby badges heard over the radio (bridged ones are too slow for a cable).
+static void refresh_peers(void)
+{
+    static os_mesh_peer_t all[MESH_PEERS_MAX];  // ~2.7 KB: too big for the OS task's stack
+    int n = os_mesh_peers(all, MESH_PEERS_MAX);
+    s_peer_count = 0;
+    for (int i = 0; i < n && s_peer_count < LINK_PEERS_MAX; i++) {
+        if (all[i].kind == OS_PEER_BADGE && !all[i].bridged) {
+            s_peers[s_peer_count++] = all[i];
+        }
+    }
+}
+
+static void show_link(void)
+{
+    link_hold(true);                        // radio on the mesh channel, so badges are heard
+    refresh_peers();
+    s_view = VIEW_LINK;
+    ui_list_set_count(s_list, s_peer_count + 1);
+    ui_list_select(s_list, 0);
+    hint(LV_SYMBOL_UP LV_SYMBOL_DOWN " badge   SELECT connect   CANCEL back");
+}
+
+// No os_mesh_pin(): the pin is one shared flag per peer, so unpinning here
+// would also unpin a trade or X Dex partner. Both badges send HELLOs every
+// ~2 s while on the mesh channel, which keeps the partner in the table.
+static void pick_link(int i)
+{
+    if (i <= 0 || i > s_peer_count) {
+        s_link_id[0] = s_link_name[0] = 0;
+    } else {
+        snprintf(s_link_id, sizeof(s_link_id), "%s", s_peers[i - 1].id);
+        snprintf(s_link_name, sizeof(s_link_name), "%s", s_peers[i - 1].name);
+        os_toast("Link cable: the other badge picks you too, then use the game's link menu");
+    }
+    link_hold(s_link_id[0]);
+    show_systems();
+    ui_list_select(s_list, ROW_LINK);
+}
+
+// The badge list follows who's nearby. It's sorted by signal strength, so the
+// selection follows the badge, not the row.
+static void tick(void)
+{
+    if (!s_list || s_view != VIEW_LINK || ++s_tick % 10) {
+        return;
+    }
+    int sel = ui_list_selected(s_list);
+    char id[OS_MESH_ID_LEN + 1] = "";
+    if (sel > 0 && sel <= s_peer_count) {
+        snprintf(id, sizeof(id), "%s", s_peers[sel - 1].id);
+    }
+    refresh_peers();
+    ui_list_set_count(s_list, s_peer_count + 1);
+    int now = id[0] ? (sel <= s_peer_count ? sel : s_peer_count) : 0;   // gone: stay near, not on "No cable"
+    for (int i = 0; id[0] && i < s_peer_count; i++) {
+        if (!strcmp(s_peers[i].id, id)) {
+            now = i + 1;
+        }
+    }
+    ui_list_select(s_list, now);
 }
 
 static void show_games(sys_t sys)
@@ -580,21 +794,35 @@ static void start(sys_t sys, const char *path)
     lv_image_set_src(s_img, &s_dsc[0]);
     lv_obj_align(s_img, LV_ALIGN_CENTER, 0, 0);
 
+    if (!nes && s_link_id[0]) {
+        s_link_seq = s_link_last = 0;
+        s_link_sent = -1;
+        s_link_q = xQueueCreate(LINK_QUEUE, sizeof(link_byte_t));
+        s_link_sub = s_link_q ? os_mesh_subscribe(OS_MESH_APP, link_heard, NULL) : -1;
+    }
+
     s_emu = e;
     s_quit = false;
     s_done = xSemaphoreCreateBinary();
+    e->done = s_done;
+    e->link_q = s_link_sub >= 0 ? s_link_q : NULL;
     if (xTaskCreate(emu_task, "retro", 6144, NULL, tskIDLE_PRIORITY, &s_task) != pdPASS) {
         os_toast("Can't start the emulator task");
         s_task = NULL;
         return;
     }
-    os_toast("BOOT exit  " LV_SYMBOL_BULLET "  UP+DOWN start  " LV_SYMBOL_BULLET "  LEFT+RIGHT select");
+    if (e->link_q) {
+        os_toast("Link cable to %s  " LV_SYMBOL_BULLET "  BOOT exit", s_link_name[0] ? s_link_name : s_link_id);
+    } else {
+        os_toast("BOOT exit  " LV_SYMBOL_BULLET "  UP+DOWN start  " LV_SYMBOL_BULLET "  LEFT+RIGHT select");
+    }
 }
 
 static void enter(lv_obj_t *root)
 {
     s_root = root;
     s_list = NULL;
+    s_view = VIEW_SYSTEMS;                  // not the view the last session ended in
     s_msg = s_img = s_hint = NULL;
     s_task = NULL;
 
@@ -606,6 +834,9 @@ static void enter(lv_obj_t *root)
     }
     s_list = ui_list_create(root, 0, OS_ROOT_H - UI_HINT_H, row, NULL);
     show_systems();
+    if (s_link_id[0]) {
+        link_hold(true);                    // keep hearing the partner chosen earlier
+    }
 }
 
 static void leave(void)
@@ -615,8 +846,16 @@ static void leave(void)
         // The task saves and exits; it never waits on the LVGL lock we hold here
         // (present() gives up after LOCK_WAIT_MS and sees s_quit).
         if (xSemaphoreTake(s_done, pdMS_TO_TICKS(3000)) != pdTRUE) {
+            // Still running: leak its state and the handles it holds (its own
+            // copies in emu_t), rather than free what it may still touch.
             ESP_LOGW(TAG, "emulator task did not stop; leaking it");
             s_emu = NULL;
+            s_done = NULL;
+            if (s_link_sub >= 0) {
+                os_mesh_unsubscribe(s_link_sub);
+                s_link_sub = -1;
+            }
+            s_link_q = NULL;
         }
         s_task = NULL;
     }
@@ -624,6 +863,15 @@ static void leave(void)
         vSemaphoreDelete(s_done);
         s_done = NULL;
     }
+    if (s_link_sub >= 0) {
+        os_mesh_unsubscribe(s_link_sub);    // returns once the handler can't run any more
+        s_link_sub = -1;
+    }
+    if (s_link_q) {
+        vQueueDelete(s_link_q);
+        s_link_q = NULL;
+    }
+    link_hold(false);
     if (s_emu) {
         if (s_emu->nes) {
             agnes_destroy(s_emu->nes);
@@ -646,15 +894,22 @@ static bool key(os_key_t k, bool repeat)
     }
     if (k == OS_KEY_SELECT && !repeat) {
         int i = ui_list_selected(s_list);
-        if (i >= 0 && s_view == VIEW_SYSTEMS) {
+        if (i == ROW_LINK && s_view == VIEW_SYSTEMS) {
+            show_link();
+        } else if (i >= 0 && s_view == VIEW_SYSTEMS) {
             show_games(i);
+        } else if (i >= 0 && s_view == VIEW_LINK) {
+            pick_link(i);
         } else if (i >= 0) {
             start(s_sys, s_roms[i]);
         }
         return true;
     }
-    if (k == OS_KEY_BACK && s_view == VIEW_GAMES) {
+    if (k == OS_KEY_BACK && (s_view == VIEW_GAMES || s_view == VIEW_LINK)) {
         if (!repeat) {
+            if (s_view == VIEW_LINK) {
+                link_hold(s_link_id[0]);    // the list kept the radio; no cable, no need
+            }
             show_systems();
         }
         return true;
@@ -670,4 +925,5 @@ const os_app_t app_gbemu = {
     .on_enter = enter,
     .on_exit = leave,
     .on_key = key,
+    .on_tick = tick,
 };
