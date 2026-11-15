@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Retro Installer</title>
+<meta name="description" content="Put Retro (Game Boy, Game Boy Color, NES) on your Solana Breakpoint badge and copy your games, from the browser.">
+<style>
+  :root {
+    --bg: #f6f6f4; --card: #ffffff; --text: #1b1b1f; --dim: #5d5d66; --line: #e2e2e6;
+    --accent: #0f7b5f; --accent-text: #ffffff; --ok: #0f7b5f; --error: #b3261e; --code: #f0f0ee;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111114; --card: #1b1b20; --text: #ececf1; --dim: #a3a3ad; --line: #2c2c33;
+      --accent: #2fc28f; --accent-text: #0b1d16; --ok: #2fc28f; --error: #ff8a80; --code: #24242a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 720px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 28px; line-height: 1.2; margin: 0 0 8px; }
+  h2 { font-size: 19px; margin: 0 0 4px; }
+  p { margin: 8px 0; }
+  .lead { color: var(--dim); margin-bottom: 24px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px; margin: 16px 0; }
+  .step { display: inline-block; font-size: 13px; font-weight: 600; color: var(--accent); margin-bottom: 4px; }
+  ol, ul { padding-left: 22px; margin: 8px 0; }
+  li { margin: 4px 0; }
+  button, .filebtn { font: inherit; font-weight: 600; border-radius: 8px; padding: 10px 16px; cursor: pointer; }
+  button.primary { background: var(--accent); color: var(--accent-text); border: 0; }
+  button:disabled, .filebtn[aria-disabled=true] { opacity: .5; cursor: not-allowed; }
+  .filebtn { display: inline-block; border: 1px solid var(--line); background: transparent; color: var(--text); }
+  .filebtn input { display: none; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+  progress { width: 100%; height: 10px; margin-top: 12px; accent-color: var(--accent); }
+  .status { margin-top: 10px; min-height: 1.5em; color: var(--dim); }
+  .status[data-kind=ok] { color: var(--ok); font-weight: 600; }
+  .status[data-kind=error] { color: var(--error); font-weight: 600; }
+  #plan { font: 13px/1.5 ui-monospace, Consolas, monospace; max-height: 180px; overflow: auto; color: var(--dim); }
+  code { background: var(--code); padding: 1px 5px; border-radius: 4px; font-size: 14px; }
+  pre.tree { background: var(--code); padding: 10px 12px; border-radius: 8px; font-size: 14px; overflow-x: auto; margin: 8px 0; }
+  .warn { border-color: var(--error); }
+  details { margin-top: 16px; color: var(--dim); }
+  #log { white-space: pre-wrap; font: 12px/1.4 ui-monospace, Consolas, monospace; max-height: 240px; overflow: auto;
+         background: var(--code); padding: 10px; border-radius: 8px; }
+  footer { color: var(--dim); font-size: 14px; margin-top: 32px; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Retro for your Solana badge</h1>
+  <p class="lead">Play Game Boy, Game Boy Color and NES games on your Breakpoint 2026 badge. Two clicks, nothing to install on your computer.</p>
+
+  <div class="card warn" id="unsupported" hidden>
+    <strong>This browser can't talk to the badge.</strong> Open this page in Chrome or Edge on a computer (Windows, Mac or Linux).
+  </div>
+
+  <div class="card">
+    <h2>Before you start</h2>
+    <ul>
+      <li>A computer with <strong>Chrome or Edge</strong>.</li>
+      <li>Your badge with its microSD card inside, and a USB cable that carries data (some only charge).</li>
+      <li>Your games. None are included: use games you copied from your own cartridges, or free homebrew games.</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <span class="step">Step 1 (recommended)</span>
+    <h2>Back up your badge</h2>
+    <p>Saves everything on your badge (system, apps, settings, badge identity) as one 16 MB file on your computer, so you can go back to exactly this state later. Takes about 10-15 minutes.</p>
+    <div class="row"><button class="primary" id="backup">Back up badge</button></div>
+    <progress id="backup-progress" max="1000" value="0" hidden></progress>
+    <div class="status" id="backup-status" role="status"></div>
+  </div>
+
+  <div class="card">
+    <span class="step">Step 2</span>
+    <h2>Install Retro</h2>
+    <p>Plug in the badge, click the button and pick <strong>USB-SERIAL CH340</strong>. Your badge keeps its Wi-Fi, badge ID and store apps. Only the operating system is updated.</p>
+    <div class="row"><button class="primary" id="install">Install Retro</button></div>
+    <progress id="install-progress" max="1000" value="0" hidden></progress>
+    <div class="status" id="install-status" role="status"></div>
+  </div>
+
+  <div class="card">
+    <span class="step">Step 3</span>
+    <h2>Copy your games</h2>
+    <p>Make a folder on your computer like this, with your games inside:</p>
+    <pre class="tree">roms/
+  gb/    Game Boy games (.gb)
+  gbc/   Game Boy Color games (.gbc)
+  nes/   NES games (.nes)</pre>
+    <p>Then choose that <code>roms</code> folder (or just pick some game files), and click <strong>Copy to badge</strong>. About 2 minutes per 1 MB.</p>
+    <div class="row">
+      <label class="filebtn">Choose roms folder<input type="file" id="folder" webkitdirectory multiple></label>
+      <label class="filebtn">Choose game files<input type="file" id="files" multiple accept=".gb,.gbc,.nes"></label>
+      <button class="primary" id="copy" disabled>Copy to badge</button>
+    </div>
+    <ul id="plan"></ul>
+    <progress id="copy-progress" max="1000" value="0" hidden></progress>
+    <div class="status" id="copy-status" role="status"></div>
+  </div>
+
+  <div class="card">
+    <span class="step">Step 4</span>
+    <h2>Play</h2>
+    <p>On the badge: open <strong>Retro</strong>, pick the console, pick the game, press SELECT.</p>
+    <ul>
+      <li>SELECT = A, CANCEL = B</li>
+      <li>UP + DOWN together = START, LEFT + RIGHT together = SELECT</li>
+      <li>BOOT (on the back) = quit. Your game is saved.</li>
+    </ul>
+    <p>Early test build: Game Boy and Game Boy Color run at about half speed, NES is very slow.</p>
+  </div>
+
+  <div class="card">
+    <h2>Go back to how it was</h2>
+    <p>Choose a backup file from step 1 to put the badge back exactly as it was then, including the original system. Games on the microSD card stay.</p>
+    <div class="row"><label class="filebtn">Restore backup<input type="file" id="restore-file" accept=".bin"></label></div>
+    <progress id="restore-progress" max="1000" value="0" hidden></progress>
+    <div class="status" id="restore-status" role="status"></div>
+  </div>
+
+  <details>
+    <summary>Details and log</summary>
+    <p id="version"></p>
+    <pre id="log"></pre>
+  </details>
+
+  <footer>
+    Community project, not official Solana Foundation software. Source, full guide and how to back up and restore your badge:
+    <a href="https://github.com/KiriKev/solana-os-gbemu">github.com/KiriKev/solana-os-gbemu</a>
+  </footer>
+</main>
+<script type="module" src="app.js"></script>
+</body>
+</html>

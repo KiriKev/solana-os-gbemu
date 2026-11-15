@@ -1,0 +1,32 @@
+{
+  "name": "Retro for Solana OS",
+  "version": "c124c81",
+  "built": "2026-11-15",
+  "flash": {
+    "flash_mode": "dio",
+    "flash_size": "16MB",
+    "flash_freq": "80m"
+  },
+  "parts": [
+    {
+      "path": "bootloader.bin",
+      "offset": 8192,
+      "size": 23280
+    },
+    {
+      "path": "partition-table.bin",
+      "offset": 32768,
+      "size": 3072
+    },
+    {
+      "path": "ota_data_initial.bin",
+      "offset": 61440,
+      "size": 8192
+    },
+    {
+      "path": "solana_os.bin",
+      "offset": 131072,
+      "size": 2391344
+    }
+  ]
+}
