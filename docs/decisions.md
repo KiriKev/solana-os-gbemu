@@ -104,3 +104,19 @@ Options: link to the command-line backup in GBEMU_SETUP.txt only; a backup/resto
 Decision: "Back up badge" reads all 16 MB in 1 MB chunks with esptool-js readFlash, checks each chunk against the MD5 the chip sends after it, retries a chunk up to 3 times with a reconnect (long reads over the CH340 broke off twice at 921600 and 460800 baud on 2026-11-14), checks the result looks like a badge (0xE9 at 0x2000, 0xAA50 at 0x8000) and downloads it. "Restore backup" accepts only such a file, asks for confirmation, writes it at 0x0 with MD5 verification.
 Evidence: VERIFIED `node installer/test.mjs`: 32 passed, 0 failed; mutants (MD5 check removed, partition magic loosened, no retry) fail 2, 1 and 1 checks. VERIFIED the magic bytes against Kev's real backup (0xe9 at 0x2000, aa50 at 0x8000, 16777216 bytes). INFERRED: that the stub sends a 16-byte MD5 packet after each read (esptool's read_flash protocol); esptool-js 0.7.0 readFlash does not read it itself. NOT VERIFIED on a badge.
 Revert: remove backup()/restore() from installer/app.js, the helpers from protocol.js and the two cards from index.html.
+
+### DEC-2026-11-15-16: Game Boy speed: no core tweak kept; the display is the remaining lever
+Context: Kev finds ~50 % speed cumbersome. Each variant was built, flashed and measured automatically: start the first Game Boy game over the console, 40-50 s of the emulator's 5 s stat lines, median of windows 2+ (same 1 MB colour-mode game every run, badge untouched).
+Options and results (median emulated fps, target 59.7):
+  baseline (Walnut-CGB, -O2): 28.5 (repeat after all trials: 27.9)
+  display off (no present): 39.6
+  gb_run_frame_dualfetch: 25.8
+  WALNUT_GB_HIGH_LCD_ACCURACY 0: 27.6
+  hot path in IRAM via linker fragment (~22 KB; CPU loop at 0x4080d7ac, verified in the map): 29.4, repeat 28.6 (core state fell to PSRAM)
+  IRAM + core state in SRAM (SRAM_KEEP 32 KB): 28.7
+  ROM bank 0 copied to SRAM: 27.8
+  WALNUT_FULL_GBC_SUPPORT 0 (no colour): 30.5
+  Peanut-GB instead of Walnut-CGB (no colour): 29.1
+Decision: keep none of the core/memory variants (all within noise, or cost colour). The only large measured lever is the display (+39 % with it off), so the next step is drawing frames to the panel directly instead of through LVGL. Even with a free display the emulation alone measured ~40 fps, so full speed is not expected on this chip with these cores.
+Evidence: VERIFIED, the numbers above from the badge console (scratchpad measure.py, trial.ps1). Run-to-run spread is about ±1.5 fps (min/max per run in the session log).
+Revert: n/a (no code change kept).
