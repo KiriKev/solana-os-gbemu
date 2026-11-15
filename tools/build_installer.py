@@ -16,7 +16,7 @@ args = json.loads((build / "flasher_args.json").read_text())
 
 if out.exists():
     shutil.rmtree(out)
-shutil.copytree(root / "installer", out)
+shutil.copytree(root / "installer", out, ignore=shutil.ignore_patterns("test.mjs"))
 (out / "firmware").mkdir()
 
 parts = []
@@ -25,8 +25,8 @@ for offset, rel in sorted(args["flash_files"].items(), key=lambda kv: int(kv[0],
     shutil.copyfile(src, out / "firmware" / src.name)
     parts.append({"path": src.name, "offset": int(offset, 16), "size": src.stat().st_size})
 
-version = subprocess.run(["git", "describe", "--always", "--dirty"], cwd=root,
-                         capture_output=True, text=True, check=True).stdout.strip()
+git = lambda *a: subprocess.run(["git", *a], cwd=root, capture_output=True, text=True, check=True).stdout.strip()
+version = git("rev-parse", "--short", "HEAD") + ("-dirty" if git("status", "--porcelain", "--untracked-files=no") else "")
 (out / "firmware" / "firmware.json").write_text(json.dumps({
     "name": "Retro for Solana OS",
     "version": version,
