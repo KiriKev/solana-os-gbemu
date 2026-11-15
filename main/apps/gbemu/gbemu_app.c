@@ -28,8 +28,10 @@
 // <rom>.state, on quit, restored at the next start.
 //
 // Link cable (Game Boy and Game Boy Color): the console list's last row picks a
-// nearby badge; both players pick each other. The serial port's bytes then go
-// over the badge mesh (os_mesh APP messages) instead of a cable.
+// nearby badge; both players pick each other, check that both screens show the
+// same 6-digit code and accept. The serial port's bytes then go over the badge
+// mesh (os_mesh APP messages) instead of a cable, tagged and encrypted with
+// keys only the two badges hold ("Link pairing" below).
 
 #include <dirent.h>
 #include <stdio.h>
@@ -42,6 +44,9 @@
 #include "freertos/queue.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "psa/crypto.h"
+#include "core/os_cloud.h"
+#include "esp_console.h"
 #include "core/os.h"
 #include "core/os_mem.h"
 #include "core/os_mesh.h"
@@ -123,7 +128,7 @@ typedef struct {
     SemaphoreHandle_t done;
 } emu_t;
 
-typedef enum { VIEW_SYSTEMS, VIEW_GAMES, VIEW_LINK, VIEW_PLAYING } view_t;
+typedef enum { VIEW_SYSTEMS, VIEW_GAMES, VIEW_LINK, VIEW_PAIR, VIEW_PLAYING } view_t;
 
 // Link cable over the badge mesh (Game Boy and Game Boy Color only).
 // The clocking side (internal clock) numbers its transfers and sends each byte
@@ -141,6 +146,8 @@ typedef enum { VIEW_SYSTEMS, VIEW_GAMES, VIEW_LINK, VIEW_PLAYING } view_t;
 #define LINK_PEERS_MAX  12
 #define MESH_PEERS_MAX  20                  // os_mesh.c's table
 #define ROW_LINK        SYS_COUNT           // the console list's last row
+#define PAIR_RESEND_MS  400
+#define PAIR_QUEUE      8
 
 typedef struct {
     uint8_t b;
@@ -148,8 +155,19 @@ typedef struct {
     uint32_t n;                             // its transfer number, or the one it answers
 } link_byte_t;
 
+// The keys of an accepted pairing: tag (HMAC) and encrypt every link byte.
+// Each side tags with its own letter ('a': its public key sorts first), so a
+// byte can't be sent back to the badge it came from.
+typedef struct {
+    uint8_t ktag[16], kenc[16];
+    char me, peer;
+} link_keys_t;
+
 static char s_link_id[OS_MESH_ID_LEN + 1];  // partner badge, "" = no cable; kept while the badge runs
 static char s_link_name[25];
+static link_keys_t s_link_keys;             // set with s_link_id, read by the mesh and emulator tasks
+static uint32_t s_link_tx_c;                // emulator task: number of the last message sent
+static uint32_t s_link_rx_c;                // mesh task: number of the last message taken
 static QueueHandle_t s_link_q;              // the mesh handler's; the emulator task uses emu_t.link_q
 static int s_link_sub = -1;
 static bool s_link_held;                    // os_mesh_acquire() taken
@@ -225,18 +243,99 @@ static void gb_err(struct gb_s *gb, const enum gb_error_e err, const uint16_t ad
 
 // ---- Link cable (mesh task and emulator task) ----
 
-// Mesh task: keep it short (os_mesh.h). Only the chosen partner's bytes count.
+static void to_hex(const uint8_t *b, int n, char *out)
+{
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < n; i++) {
+        out[i * 2] = hex[b[i] >> 4];
+        out[i * 2 + 1] = hex[b[i] & 15];
+    }
+    out[n * 2] = 0;
+}
+
+static int hex_val(char c)
+{
+    return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
+}
+
+// Exactly 2n lowercase hex digits, then the closing quote.
+static bool from_hex(const char *in, uint8_t *out, int n)
+{
+    for (int i = 0; i < n; i++) {
+        int hi = hex_val(in[i * 2]), lo = hi < 0 ? -1 : hex_val(in[i * 2 + 1]);
+        if (lo < 0) {
+            return false;
+        }
+        out[i] = (uint8_t)(hi << 4 | lo);
+    }
+    return in[n * 2] == '"';
+}
+
+// One-byte pad for message c from side dir: never repeats within a pairing.
+static uint8_t link_pad(const link_keys_t *k, char dir, uint32_t c)
+{
+    char in[24], tag[OS_MESH_TAG_LEN + 1];
+    snprintf(in, sizeof(in), "p|%c|%lu", dir, (unsigned long)c);
+    os_mesh_tag(k->kenc, in, tag);
+    return (uint8_t)(hex_val(tag[0]) << 4 | hex_val(tag[1]));
+}
+
+static void link_tag(const link_keys_t *k, char dir, unsigned be, int m, unsigned long n, uint32_t c,
+                     char out[OS_MESH_TAG_LEN + 1])
+{
+    char in[64];
+    snprintf(in, sizeof(in), "t|%c|%u|%d|%lu|%lu", dir, be, m, n, (unsigned long)c);
+    os_mesh_tag(k->ktag, in, out);
+}
+
+// The message for byte b as message number c from this side.
+static void link_seal(const link_keys_t *k, uint32_t c, uint8_t b, bool master, uint32_t n, char *out, size_t len)
+{
+    unsigned be = b ^ link_pad(k, k->me, c);
+    char tag[OS_MESH_TAG_LEN + 1];
+    link_tag(k, k->me, be, master, n, c, tag);
+    snprintf(out, len, "{\"app\":\"" LINK_APP "\",\"b\":%u,\"m\":%d,\"n\":%lu,\"c\":%lu,\"t\":\"%s\"}", be, master,
+             (unsigned long)n, (unsigned long)c, tag);
+}
+
+// The partner's byte, if json is a message it sealed after message last_c.
+static bool link_open(const link_keys_t *k, const char *json, uint32_t last_c, link_byte_t *v, uint32_t *c)
+{
+    const char *b = strstr(json, "\"b\":"), *m = strstr(json, "\"m\":"), *n = strstr(json, "\"n\":");
+    const char *cc = strstr(json, "\"c\":"), *t = strstr(json, "\"t\":\"");
+    if (!b || !m || !n || !cc || !t || strlen(t + 5) < OS_MESH_TAG_LEN + 1 || t[5 + OS_MESH_TAG_LEN] != '"') {
+        return false;
+    }
+    unsigned long be = strtoul(b + 4, NULL, 10), nv = strtoul(n + 4, NULL, 10), cv = strtoul(cc + 4, NULL, 10);
+    int mv = m[4] == '1';
+    if (be > 255 || cv <= last_c) {
+        return false;                       // a replay, or out of range
+    }
+    char want[OS_MESH_TAG_LEN + 1];
+    link_tag(k, k->peer, (unsigned)be, mv, nv, (uint32_t)cv, want);
+    uint8_t diff = 0;
+    for (int i = 0; i < OS_MESH_TAG_LEN; i++) {
+        diff |= (uint8_t)(want[i] ^ t[5 + i]);
+    }
+    if (diff) {
+        return false;
+    }
+    *c = (uint32_t)cv;
+    *v = (link_byte_t){.b = (uint8_t)be ^ link_pad(k, k->peer, (uint32_t)cv), .master = mv, .n = (uint32_t)nv};
+    return true;
+}
+
+// Mesh task: keep it short (os_mesh.h). Only bytes the paired partner sealed count.
 static void link_heard(os_mesh_type_t type, const os_mesh_peer_t *from, const char *json, void *ctx)
 {
     QueueHandle_t q = s_link_q;
-    if (!q || strcmp(from->id, s_link_id) || !strstr(json, "\"app\":\"" LINK_APP "\"")) {
+    link_byte_t v;
+    uint32_t c;
+    if (!q || strcmp(from->id, s_link_id) || !strstr(json, "\"app\":\"" LINK_APP "\"") ||
+        !link_open(&s_link_keys, json, s_link_rx_c, &v, &c)) {
         return;
     }
-    const char *b = strstr(json, "\"b\":"), *m = strstr(json, "\"m\":"), *n = strstr(json, "\"n\":");
-    if (!b || !m || !n) {
-        return;
-    }
-    link_byte_t v = {.b = (uint8_t)atoi(b + 4), .master = m[4] == '1', .n = (uint32_t)strtoul(n + 4, NULL, 10)};
+    s_link_rx_c = c;
     if (xQueueSend(q, &v, 0) != pdTRUE) {   // full: drop the oldest, keep the newest
         link_byte_t old;
         xQueueReceive(q, &old, 0);
@@ -246,8 +345,8 @@ static void link_heard(os_mesh_type_t type, const os_mesh_peer_t *from, const ch
 
 static void link_send(uint8_t b, bool master, uint32_t n)
 {
-    char msg[96];
-    snprintf(msg, sizeof(msg), "{\"app\":\"" LINK_APP "\",\"b\":%u,\"m\":%d,\"n\":%lu}", b, master, (unsigned long)n);
+    char msg[128];
+    link_seal(&s_link_keys, ++s_link_tx_c, b, master, n, msg, sizeof(msg));
     os_mesh_send(OS_MESH_APP, s_link_id, msg);  // fails while the partner is out of range: the game sees no cable
 }
 
@@ -303,6 +402,363 @@ static void link_hold(bool on)
     if (on != s_link_held) {
         on ? os_mesh_acquire() : os_mesh_release();
         s_link_held = on;
+    }
+}
+
+// ---- Link pairing (OS task; the mesh handler only queues) ----
+//
+// Both badges make a fresh X25519 key pair. The badge whose id sorts first (the
+// host) sends a commitment, the SHA-256 of its public key, and reveals the key
+// only after the guest has sent its own; the guest reveals its key only for a
+// commitment it holds. So neither side can choose its key after seeing the
+// other's, and someone in between who swaps keys gets two different codes:
+// both screens show a 6-digit code from the two keys and the shared secret,
+// and the players compare them (1 in a million that a swap matches). The
+// shared secret also gives the link keys. A new commitment (the host picked
+// again) starts the guest over with a new key pair; a different key for the
+// same commitment (the guest picked again) starts the host over. Each such
+// restart would be one more try for someone in between, so after
+// PAIR_RESTARTS_MAX of them the players pick each other again; after SELECT,
+// a restart drops the link instead.
+//
+// Messages, "r" the first 8 bytes of the commitment they belong to:
+//   host:  {"p":"c","v":<commitment>}  and, once it has the guest's key,
+//          {"p":"k","v":<host key>,"r":..}
+//   guest: {"p":"k","v":<guest key>,"r":..}
+// Both keep sending every PAIR_RESEND_MS, also after SELECT and while the
+// game runs, until Retro closes or the pairing is dropped, in case the
+// partner missed one.
+
+typedef enum { PAIR_OFF, PAIR_WAIT, PAIR_CONFIRM, PAIR_ACCEPTED } pair_state_t;
+
+typedef struct {
+    char p;                                 // 'c' commitment, 'k' key
+    uint8_t v[32];
+    uint8_t r[8];
+    bool has_r;
+} pair_msg_t;
+
+// One side of a pairing: the protocol alone, no radio and no screen, so the
+// self-test can run two of them against each other.
+typedef struct {
+    pair_state_t state;
+    bool host;
+    int restarts;                           // rounds started over after we had revealed a key
+    psa_key_id_t key;
+    uint8_t pk[32], commit[32];             // ours; commit: the host's (its own, or the one the guest holds)
+    bool have_commit;
+    uint8_t peer_pk[32];
+    bool have_peer;
+    char code[7];
+    link_keys_t keys;
+} pair_t;
+
+// What a message did to a pair_t, worst last.
+typedef enum {
+    PAIR_EV_NONE,                           // nothing: a copy, or not for this round
+    PAIR_EV_NEW,                            // a new state: show it and send at once
+    PAIR_EV_RESTARTED,                      // the partner started over after we accepted
+    PAIR_EV_TOO_MANY,                       // more than PAIR_RESTARTS_MAX restarts
+    PAIR_EV_FAILED,                         // no key pair, or a key without a secret
+} pair_ev_t;
+
+// Each restart after a reveal is one more try at a matching code for someone
+// in between; past this many, the players have to pick each other again.
+#define PAIR_RESTARTS_MAX   2
+
+static struct {
+    pair_t p;
+    bool demo;                              // the self-test's card: nothing to accept
+    char id[OS_MESH_ID_LEN + 1], name[25];
+    int level;
+    TickType_t sent_at;
+    QueueHandle_t q;
+    int sub;
+} s_pair = {.sub = -1};
+
+static struct {
+    lv_obj_t *box, *initial, *name, *sub, *status, *digit[6], *btn_a;
+} s_card;
+
+static void card_update(void);
+static void card_show(void);
+static void pair_start(const os_mesh_peer_t *p);
+
+static void sha256_of(const uint8_t *in, size_t n, uint8_t out[32])
+{
+    size_t len = 0;
+    psa_hash_compute(PSA_ALG_SHA_256, in, n, out, 32, &len);
+}
+
+// SHA-256 of label and three 32-byte parts.
+static void sha256_parts(const char *label, const uint8_t *a, const uint8_t *b, const uint8_t *c, uint8_t out[32])
+{
+    psa_hash_operation_t h = PSA_HASH_OPERATION_INIT;
+    size_t len = 0;
+    psa_hash_setup(&h, PSA_ALG_SHA_256);
+    psa_hash_update(&h, (const uint8_t *)label, strlen(label));
+    psa_hash_update(&h, a, 32);
+    psa_hash_update(&h, b, 32);
+    psa_hash_update(&h, c, 32);
+    psa_hash_finish(&h, out, 32, &len);
+    psa_hash_abort(&h);
+}
+
+// A fresh X25519 key pair: *key the private key (PSA keeps it), pk the public key.
+static bool pair_keygen(psa_key_id_t *key, uint8_t pk[32])
+{
+    psa_key_attributes_t a = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_type(&a, PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_MONTGOMERY));
+    psa_set_key_bits(&a, 255);
+    psa_set_key_usage_flags(&a, PSA_KEY_USAGE_DERIVE);
+    psa_set_key_algorithm(&a, PSA_ALG_ECDH);
+    size_t n = 0;
+    *key = PSA_KEY_ID_NULL;
+    if (psa_crypto_init() != PSA_SUCCESS || psa_generate_key(&a, key) != PSA_SUCCESS) {
+        return false;
+    }
+    if (psa_export_public_key(*key, pk, 32, &n) != PSA_SUCCESS || n != 32) {
+        psa_destroy_key(*key);
+        *key = PSA_KEY_ID_NULL;
+        return false;
+    }
+    return true;
+}
+
+// From our key and the partner's public key: the code both screens show and
+// the link keys. False for a key that gives no secret (a low-order point).
+static bool pair_derive(psa_key_id_t key, const uint8_t pk[32], const uint8_t peer_pk[32], char code[7],
+                        link_keys_t *k)
+{
+    uint8_t shared[32], h[32];
+    size_t n = 0;
+    if (psa_raw_key_agreement(PSA_ALG_ECDH, key, peer_pk, 32, shared, sizeof(shared), &n) != PSA_SUCCESS ||
+        n != 32) {
+        return false;
+    }
+    uint8_t any = 0;
+    for (int i = 0; i < 32; i++) {
+        any |= shared[i];
+    }
+    if (!any) {
+        return false;                       // RFC 7748: a low-order key gives all zeros
+    }
+    bool first = memcmp(pk, peer_pk, 32) < 0;
+    const uint8_t *a = first ? pk : peer_pk, *b = first ? peer_pk : pk;
+    sha256_parts("retro-link code v1", a, b, shared, h);
+    uint32_t v = (uint32_t)h[0] << 24 | (uint32_t)h[1] << 16 | (uint32_t)h[2] << 8 | h[3];
+    snprintf(code, 7, "%06lu", (unsigned long)(v % 1000000));
+    sha256_parts("retro-link keys v1", a, b, shared, h);
+    memcpy(k->ktag, h, 16);
+    memcpy(k->kenc, h + 16, 16);
+    k->me = first ? 'a' : 'b';
+    k->peer = first ? 'b' : 'a';
+    memset(shared, 0, sizeof(shared));
+    memset(h, 0, sizeof(h));
+    return true;
+}
+
+// A pairing message, as pair_build writes them.
+static bool pair_parse(const char *json, pair_msg_t *m)
+{
+    const char *p = strstr(json, "\"p\":\""), *v = strstr(json, "\"v\":\""), *r = strstr(json, "\"r\":\"");
+    memset(m, 0, sizeof(*m));
+    if (!strstr(json, "\"app\":\"" LINK_APP "\"") || !p || !v || (p[5] != 'c' && p[5] != 'k') ||
+        !from_hex(v + 5, m->v, 32)) {
+        return false;
+    }
+    m->p = p[5];
+    m->has_r = r && from_hex(r + 5, m->r, 8);
+    return true;
+}
+
+// What this side sends now (sent again every PAIR_RESEND_MS): returns how many.
+static int pair_build(const pair_t *p, char out[2][200])
+{
+    char hex[65], r[17];
+    int n = 0;
+    to_hex(p->commit, 8, r);
+    if (p->host) {
+        to_hex(p->commit, 32, hex);
+        snprintf(out[n++], 200, "{\"app\":\"" LINK_APP "\",\"p\":\"c\",\"v\":\"%s\"}", hex);
+    }
+    if (p->host ? p->have_peer : p->have_commit) {
+        to_hex(p->pk, 32, hex);
+        snprintf(out[n++], 200, "{\"app\":\"" LINK_APP "\",\"p\":\"k\",\"v\":\"%s\",\"r\":\"%s\"}", hex, r);
+    }
+    return n;
+}
+
+// A new key pair for a new round; the host commits to it.
+static bool pair_round(pair_t *p)
+{
+    if (p->key != PSA_KEY_ID_NULL) {
+        psa_destroy_key(p->key);
+    }
+    p->have_peer = false;
+    p->state = PAIR_WAIT;
+    if (!pair_keygen(&p->key, p->pk)) {
+        return false;
+    }
+    if (p->host) {
+        sha256_of(p->pk, 32, p->commit);
+        p->have_commit = true;
+    }
+    return true;
+}
+
+static void pair_reset(pair_t *p)
+{
+    if (p->key != PSA_KEY_ID_NULL) {
+        psa_destroy_key(p->key);
+    }
+    memset(p, 0, sizeof(*p));
+}
+
+static pair_ev_t pair_step(pair_t *p, const pair_msg_t *m)
+{
+    if (!p->host && m->p == 'c') {
+        if (p->have_commit && !memcmp(m->v, p->commit, 32)) {
+            return PAIR_EV_NONE;            // a copy
+        }
+        // A new round (the host picked again): a new key pair, revealed only
+        // for this commitment. A restart if we had revealed one already.
+        if (p->state == PAIR_ACCEPTED) {
+            return PAIR_EV_RESTARTED;
+        }
+        if (p->have_commit && ++p->restarts > PAIR_RESTARTS_MAX) {
+            return PAIR_EV_TOO_MANY;
+        }
+        if (!pair_round(p)) {
+            return PAIR_EV_FAILED;
+        }
+        memcpy(p->commit, m->v, 32);
+        p->have_commit = true;
+        return PAIR_EV_NEW;
+    }
+    if (m->p != 'k' || !m->has_r || !p->have_commit || memcmp(m->r, p->commit, 8)) {
+        return PAIR_EV_NONE;
+    }
+    if (p->have_peer) {
+        if (!memcmp(m->v, p->peer_pk, 32) || !p->host) {
+            return PAIR_EV_NONE;            // a copy; the guest takes one host key per round
+        }
+        // The host got a different guest key for its round (the guest picked
+        // again): a new round, as the host has revealed its key.
+        if (p->state == PAIR_ACCEPTED) {
+            return PAIR_EV_RESTARTED;
+        }
+        if (++p->restarts > PAIR_RESTARTS_MAX) {
+            return PAIR_EV_TOO_MANY;
+        }
+        return pair_round(p) ? PAIR_EV_NEW : PAIR_EV_FAILED;
+    }
+    if (!p->host) {
+        uint8_t h[32];
+        sha256_of(m->v, 32, h);
+        if (memcmp(h, p->commit, 32)) {
+            return PAIR_EV_NONE;            // not the key the host committed to
+        }
+    }
+    memcpy(p->peer_pk, m->v, 32);
+    p->have_peer = true;
+    if (!pair_derive(p->key, p->pk, p->peer_pk, p->code, &p->keys)) {
+        return PAIR_EV_FAILED;
+    }
+    p->state = PAIR_CONFIRM;
+    return PAIR_EV_NEW;
+}
+
+// Mesh task: queue the partner's pairing messages for the OS task.
+static void pair_heard(os_mesh_type_t type, const os_mesh_peer_t *from, const char *json, void *ctx)
+{
+    QueueHandle_t q = s_pair.q;
+    pair_msg_t m;
+    if (q && !strcmp(from->id, s_pair.id) && pair_parse(json, &m)) {
+        xQueueSend(q, &m, 0);               // full: dropped, the partner sends again
+    }
+}
+
+static void pair_send(void)
+{
+    char msg[2][200];
+    int n = pair_build(&s_pair.p, msg);
+    for (int i = 0; i < n; i++) {
+        os_mesh_send(OS_MESH_APP, s_pair.id, msg[i]);
+    }
+    s_pair.sent_at = xTaskGetTickCount();
+}
+
+static void card_close(void)
+{
+    if (s_card.box) {
+        lv_obj_delete(s_card.box);
+        if (s_list) {
+            ui_list_show(s_list, true);     // card_show hid it
+        }
+    }
+    memset(&s_card, 0, sizeof(s_card));
+}
+
+// Ends the pairing (not an accepted link) and wipes its secrets.
+static void pair_stop(void)
+{
+    if (s_pair.sub >= 0) {
+        os_mesh_unsubscribe(s_pair.sub);    // returns once pair_heard can't run any more
+    }
+    if (s_pair.q) {
+        vQueueDelete(s_pair.q);
+    }
+    pair_reset(&s_pair.p);
+    memset(&s_pair, 0, sizeof(s_pair));
+    s_pair.sub = -1;
+    card_close();
+}
+
+static void show_link(void);
+
+static void pair_fail(const char *why)
+{
+    bool on_card = s_view == VIEW_PAIR;
+    pair_stop();
+    os_toast("%s", why);
+    if (on_card) {
+        show_link();
+    }
+}
+
+static void pair_tick(void)
+{
+    pair_msg_t m;
+    while (s_pair.q && xQueueReceive(s_pair.q, &m, 0) == pdTRUE) {
+        pair_ev_t ev = pair_step(&s_pair.p, &m);
+        if (ev == PAIR_EV_NEW) {
+            card_update();
+            pair_send();
+        } else if (ev == PAIR_EV_RESTARTED) {
+            if (s_view == VIEW_PLAYING) {
+                pair_stop();                // the game holds the link: it stays as it is
+                return;
+            }
+            // Our keys no longer match the partner's: drop the link.
+            s_link_id[0] = s_link_name[0] = 0;
+            memset(&s_link_keys, 0, sizeof(s_link_keys));
+            pair_fail("The other badge paired again: pick it again in Link cable");
+            if (s_view == VIEW_SYSTEMS) {
+                ui_list_refresh(s_list);
+            }
+            return;
+        } else if (ev == PAIR_EV_TOO_MANY) {
+            pair_fail("The other badge started over too often: pick it again");
+            return;
+        } else if (ev == PAIR_EV_FAILED) {
+            pair_fail("Pairing failed: pick the badge again");
+            return;
+        }
+    }
+    if (s_pair.p.state != PAIR_OFF && !s_pair.demo &&
+        xTaskGetTickCount() - s_pair.sent_at >= pdMS_TO_TICKS(PAIR_RESEND_MS)) {
+        pair_send();
     }
 }
 
@@ -723,22 +1179,250 @@ static void show_link(void)
 // ~2 s while on the mesh channel, which keeps the partner in the table.
 static void pick_link(int i)
 {
-    if (i <= 0 || i > s_peer_count) {
-        s_link_id[0] = s_link_name[0] = 0;
-    } else {
-        snprintf(s_link_id, sizeof(s_link_id), "%s", s_peers[i - 1].id);
-        snprintf(s_link_name, sizeof(s_link_name), "%s", s_peers[i - 1].name);
-        os_toast("Link cable: the other badge picks you too, then use the game's link menu");
+    if (i > 0 && i <= s_peer_count) {
+        pair_start(&s_peers[i - 1]);        // the link starts once both accept the code
+        return;
     }
-    link_hold(s_link_id[0]);
+    pair_stop();
+    s_link_id[0] = s_link_name[0] = 0;
+    memset(&s_link_keys, 0, sizeof(s_link_keys));
+    link_hold(false);
     show_systems();
     ui_list_select(s_list, ROW_LINK);
+}
+
+// SELECT on the card: this badge takes the partner's bytes from now on. The
+// pairing keeps answering until the game starts, in case the partner missed
+// our key.
+static void pair_accept(void)
+{
+    if (s_pair.demo) {
+        pair_stop();
+        show_systems();
+        return;
+    }
+    if (s_pair.p.state != PAIR_CONFIRM) {
+        return;
+    }
+    snprintf(s_link_id, sizeof(s_link_id), "%s", s_pair.id);
+    snprintf(s_link_name, sizeof(s_link_name), "%s", s_pair.name);
+    s_link_keys = s_pair.p.keys;
+    s_link_tx_c = s_link_rx_c = 0;
+    s_pair.p.state = PAIR_ACCEPTED;
+    card_close();
+    os_toast("Linked with %s: start the game, then its link menu", s_link_name[0] ? s_link_name : s_link_id);
+    show_systems();
+    ui_list_select(s_list, ROW_LINK);
+}
+
+// ---- Self-test: `retro selftest` on the console ----
+//
+// Runs the crypto and two pair_t sides against each other on this badge (also
+// with lost messages, a partner starting over and someone trying codes),
+// checks the link messages, and, if Retro is open on its menus with no pairing
+// going, shows the card with the code it got.
+
+extern const os_app_t app_gbemu;
+static char s_demo_code[7];
+
+static void demo_card(void *arg)
+{
+    if (os_current() != &app_gbemu || !s_list || (s_view != VIEW_SYSTEMS && s_view != VIEW_LINK) ||
+        s_pair.p.state != PAIR_OFF) {
+        return;
+    }
+    s_pair.demo = true;
+    s_pair.p.state = PAIR_CONFIRM;
+    snprintf(s_pair.id, sizeof(s_pair.id), "SELF01");
+    snprintf(s_pair.name, sizeof(s_pair.name), "@selftest");
+    s_pair.level = 1;
+    memcpy(s_pair.p.code, s_demo_code, sizeof(s_pair.p.code));
+    s_view = VIEW_PAIR;
+    card_show();
+}
+
+// Delivers what `from` sends now to `to`, skipping every drop-th message of
+// *count (0: none). Returns the worst event.
+static pair_ev_t st_deliver(const pair_t *from, pair_t *to, int *count, int drop)
+{
+    char msg[2][200];
+    pair_ev_t worst = PAIR_EV_NONE;
+    int n = pair_build(from, msg);
+    for (int i = 0; i < n; i++) {
+        pair_msg_t m;
+        if ((drop && ++*count % drop == 0) || !pair_parse(msg[i], &m)) {
+            continue;
+        }
+        pair_ev_t ev = pair_step(to, &m);
+        worst = ev > worst ? ev : worst;
+        vTaskDelay(1);                      // key work takes ~0.1 s: let the idle task (watchdog) run
+    }
+    return worst;
+}
+
+// Resend rounds until both show a code; false on a failure or after `rounds`.
+static bool st_run(pair_t *h, pair_t *g, int drop, int rounds)
+{
+    int count = 0;
+    for (int i = 0; i < rounds; i++) {
+        pair_ev_t a = st_deliver(h, g, &count, drop), b = st_deliver(g, h, &count, drop);
+        if (a >= PAIR_EV_RESTARTED || b >= PAIR_EV_RESTARTED) {
+            return false;
+        }
+        if (h->state == PAIR_CONFIRM && g->state == PAIR_CONFIRM) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool st_begin(pair_t *p, bool host)
+{
+    vTaskDelay(1);
+    pair_reset(p);
+    p->host = host;
+    return pair_round(p);
+}
+
+static bool st_same(const pair_t *h, const pair_t *g)
+{
+    return !strcmp(h->code, g->code) && !memcmp(h->keys.ktag, g->keys.ktag, 16) &&
+           !memcmp(h->keys.kenc, g->keys.kenc, 16) && h->keys.me == g->keys.peer && h->keys.peer == g->keys.me;
+}
+
+static int cmd_retro(int argc, char **argv)
+{
+    if (argc != 2 || strcmp(argv[1], "selftest")) {
+        printf("usage: retro selftest\n");
+        return 1;
+    }
+    int ok = 0, bad = 0;
+#define CHECK(cond, what)                       \
+    do {                                        \
+        if (cond) {                             \
+            ok++;                               \
+        } else {                                \
+            bad++;                              \
+            printf("FAIL: %s\n", what);         \
+        }                                       \
+    } while (0)
+    // Crypto.
+    psa_key_id_t ka = PSA_KEY_ID_NULL, kb = PSA_KEY_ID_NULL, km = PSA_KEY_ID_NULL;
+    uint8_t pa[32], pb[32], pm[32], commit[32], h[32], zero[32] = {0};
+    char code_a[7] = "", code_b[7] = "", code_m[7] = "", code_z[7];
+    link_keys_t la = {0}, lb = {0}, lm = {0}, lz;
+    bool gen = pair_keygen(&ka, pa) && pair_keygen(&kb, pb) && pair_keygen(&km, pm);
+    vTaskDelay(1);
+    CHECK(gen, "three X25519 key pairs");
+    if (gen) {
+        sha256_of(pa, 32, commit);
+        sha256_of(pb, 32, h);
+        CHECK(memcmp(h, commit, 32), "a commitment refuses another key");
+        bool da = pair_derive(ka, pa, pb, code_a, &la), db = pair_derive(kb, pb, pa, code_b, &lb);
+        CHECK(da && db && strlen(code_a) == 6 && !strcmp(code_a, code_b), "the same 6-digit code on both sides");
+        CHECK(da && db && !memcmp(la.ktag, lb.ktag, 16) && !memcmp(la.kenc, lb.kenc, 16) && la.me == lb.peer &&
+                  la.peer == lb.me && la.me != la.peer,
+              "the same link keys, opposite sides");
+        CHECK(pair_derive(ka, pa, pm, code_m, &lm) && strcmp(code_m, code_a), "a swapped key gives another code");
+        CHECK(!pair_derive(ka, pa, zero, code_z, &lz), "a low-order key is refused");
+
+        // Link messages.
+        char msg[128];
+        link_byte_t v = {0};
+        uint32_t c = 0;
+        unsigned first = 256;
+        int plain = 0, same = 0;
+        for (uint32_t i = 1; i <= 16; i++) {
+            link_seal(&la, i, 0x5A, true, 7, msg, sizeof(msg));
+            unsigned be = (unsigned)strtoul(strstr(msg, "\"b\":") + 4, NULL, 10);
+            plain += be == 0x5A;
+            same += be == first;
+            first = i == 1 ? be : first;
+        }
+        CHECK(plain < 16 && same < 15, "bytes go out encrypted, each with its own pad");
+        link_seal(&la, 1, 0x5A, true, 7, msg, sizeof(msg));
+        CHECK(link_open(&lb, msg, 0, &v, &c) && v.b == 0x5A && v.master && v.n == 7 && c == 1, "the partner opens it");
+        CHECK(!link_open(&lb, msg, 1, &v, &c), "a replay is refused");
+        CHECK(!link_open(&la, msg, 0, &v, &c), "an echo to the sender is refused");
+        CHECK(!link_open(&lm, msg, 0, &v, &c), "other keys are refused");
+        char *t = strstr(msg, "\"t\":\"") + 5;
+        t[0] = t[0] == '0' ? '1' : '0';
+        CHECK(!link_open(&lb, msg, 0, &v, &c), "a changed tag is refused");
+        link_seal(&la, 2, 0x5A, true, 7, msg, sizeof(msg));
+        *(strstr(msg, "\"n\":") + 4) = '8';
+        CHECK(!link_open(&lb, msg, 1, &v, &c), "a changed transfer number is refused");
+        link_seal(&la, 3, 0x5A, true, 7, msg, sizeof(msg));
+        char *b = strstr(msg, ",\"m\"") - 1;  // the byte's last digit: stays 0..255 either way
+        *b = *b == '0' ? '1' : *b - 1;
+        CHECK(!link_open(&lb, msg, 2, &v, &c), "a changed byte is refused");
+    }
+    psa_destroy_key(ka);
+    psa_destroy_key(kb);
+    psa_destroy_key(km);
+
+    // The protocol: host H, guest G, someone in between M.
+    static pair_t H, G, M;                  // ~400 B: off the console task's stack
+    int count = 0;
+    bool run = st_begin(&H, true) && st_begin(&G, false) && st_run(&H, &G, 0, 4);
+    CHECK(run && st_same(&H, &G), "two sides pair, same code and keys");
+    // Every third: with one message each way per round, every second would
+    // always hit the guest's and starve it.
+    run = st_begin(&H, true) && st_begin(&G, false) && st_run(&H, &G, 3, 20);
+    CHECK(run && st_same(&H, &G), "they pair with every third message lost");
+    run = run && st_begin(&G, false) && st_run(&H, &G, 0, 6);
+    CHECK(run && st_same(&H, &G) && H.restarts == 1, "the guest picks again: the host starts over once");
+    G.state = PAIR_ACCEPTED;
+    CHECK(run && pair_round(&H) && st_deliver(&H, &G, &count, 0) == PAIR_EV_RESTARTED,
+          "after SELECT, a host starting over drops the link");
+    // M as host: the guest takes only the key H committed to.
+    {
+        pair_msg_t m = {.p = 'k', .has_r = true};
+        bool fresh = st_begin(&H, true) && st_begin(&G, false) && st_begin(&M, true);
+        st_deliver(&H, &G, &count, 0);      // G holds H's commitment
+        memcpy(m.v, M.pk, 32);
+        memcpy(m.r, H.commit, 8);
+        CHECK(fresh && pair_step(&G, &m) == PAIR_EV_NONE && G.state == PAIR_WAIT,
+              "the guest refuses a key the host didn't commit to");
+    }
+    // M as host, sending the guest new commitments to try codes.
+    pair_ev_t ev = PAIR_EV_NONE;
+    bool grind = st_begin(&G, false) && st_begin(&M, true);
+    for (int i = 0; grind && i <= PAIR_RESTARTS_MAX + 1 && ev < PAIR_EV_RESTARTED; i++) {
+        ev = (i == 0 || pair_round(&M)) ? st_deliver(&M, &G, &count, 0) : PAIR_EV_FAILED;
+    }
+    CHECK(grind && ev == PAIR_EV_TOO_MANY && G.restarts == PAIR_RESTARTS_MAX + 1,
+          "new commitments: the guest gives up after the limit");
+    // M as guest, sending the host new keys for its rounds.
+    ev = PAIR_EV_NONE;
+    grind = st_begin(&H, true) && st_begin(&M, false);
+    M.restarts = -100;                      // M's own limit doesn't count
+    for (int i = 0; grind && i < 4 * (PAIR_RESTARTS_MAX + 1) && ev < PAIR_EV_RESTARTED; i++) {
+        st_deliver(&H, &M, &count, 0);      // M takes the host's current commitment
+        if (i > 0 && H.state == PAIR_CONFIRM && !pair_round(&M)) {
+            grind = false;                  // M: another key for the same round
+        }
+        ev = st_deliver(&M, &H, &count, 0);
+    }
+    CHECK(grind && ev == PAIR_EV_TOO_MANY, "new guest keys: the host gives up after the limit");
+    pair_reset(&H);
+    pair_reset(&G);
+    pair_reset(&M);
+#undef CHECK
+    printf("retro selftest: %d passed, %d failed\n", ok, bad);
+    if (!bad) {
+        memcpy(s_demo_code, code_a, sizeof(s_demo_code));
+        os_post(demo_card, NULL);
+    }
+    return bad ? 1 : 0;
 }
 
 // The badge list follows who's nearby. It's sorted by signal strength, so the
 // selection follows the badge, not the row.
 static void tick(void)
 {
+    if (s_pair.p.state != PAIR_OFF) {
+        pair_tick();
+    }
     if (!s_list || s_view != VIEW_LINK || ++s_tick % 10) {
         return;
     }
@@ -756,6 +1440,129 @@ static void tick(void)
         }
     }
     ui_list_select(s_list, now);
+}
+
+// The pairing card, laid out like a Game Boy Color in Solana colours: the
+// colour stripe, a screen with the partner and the code, A and B buttons.
+#define CARD_W      (OS_ROOT_W - 24)
+#define CARD_H      (OS_ROOT_H - UI_HINT_H - 4)
+#define SCREEN_W    (CARD_W - 28)
+
+static lv_obj_t *card_box(lv_obj_t *parent, int x, int y, int w, int h, uint32_t bg, uint32_t border, int bw,
+                          int radius)
+{
+    lv_obj_t *o = lv_obj_create(parent);
+    lv_obj_remove_style_all(o);
+    lv_obj_set_pos(o, x, y);
+    lv_obj_set_size(o, w, h);
+    lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(o, ui_col(bg), 0);
+    lv_obj_set_style_border_width(o, bw, 0);
+    lv_obj_set_style_border_color(o, ui_col(border), 0);
+    lv_obj_set_style_radius(o, radius, 0);
+    lv_obj_set_scrollable(o, false);
+    return o;
+}
+
+static lv_obj_t *card_button(lv_obj_t *parent, int x, int y, uint32_t bg, uint32_t fg, const char *letter,
+                             const char *caption)
+{
+    lv_obj_t *b = card_box(parent, x, y, 32, 32, bg, bg, 0, LV_RADIUS_CIRCLE);
+    lv_obj_t *l = ui_label(b, &sol_font_14, fg, letter);
+    lv_obj_center(l);
+    lv_obj_t *c = ui_label(parent, &sol_mono_12, COL_DIM, caption);
+    lv_obj_set_width(c, 48);
+    lv_obj_set_style_text_align(c, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(c, x - 8, y + 34);
+    return b;
+}
+
+static void card_show(void)
+{
+    card_close();
+    ui_list_show(s_list, false);
+    lv_obj_t *box = card_box(s_root, 12, 2, CARD_W, CARD_H, COL_PANEL_HI, COL_BORDER, 1, 16);
+    s_card.box = box;
+    ui_gradient_bar(box, 14, 10, SCREEN_W, 4);
+    lv_obj_t *t = ui_label(box, &sol_mono_12, COL_DIM, "RETRO LINK");
+    lv_obj_set_pos(t, 14, 18);
+
+    lv_obj_t *scr = card_box(box, 14, 34, SCREEN_W, 96, COL_BG, COL_PURPLE, 2, 10);
+    lv_obj_t *av = card_box(scr, 10, 8, 30, 30, COL_PURPLE, COL_PURPLE, 0, LV_RADIUS_CIRCLE);
+    s_card.initial = ui_label(av, &sol_font_14, COL_TEXT, "");
+    lv_obj_center(s_card.initial);
+    s_card.name = ui_label(scr, &sol_font_20, COL_TEXT, "");
+    lv_obj_set_width(s_card.name, SCREEN_W - 60);
+    lv_label_set_long_mode(s_card.name, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_pos(s_card.name, 48, 4);
+    s_card.sub = ui_label(scr, &sol_mono_12, COL_DIM, "");
+    lv_obj_set_pos(s_card.sub, 48, 27);
+    const int dw = 34, gap = 6, mid = 8, x0 = (SCREEN_W - 4 - (6 * dw + 5 * gap + mid)) / 2;
+    for (int i = 0; i < 6; i++) {
+        lv_obj_t *d = card_box(scr, x0 + i * (dw + gap) + (i >= 3 ? mid : 0), 48, dw, 38, COL_PANEL, COL_GREEN, 1, 6);
+        s_card.digit[i] = ui_label(d, &sol_font_20, COL_GREEN, "");
+        lv_obj_center(s_card.digit[i]);
+    }
+
+    s_card.status = ui_label(box, &sol_font_14, COL_TEXT, "");
+    lv_obj_set_width(s_card.status, CARD_W - 130);
+    lv_label_set_long_mode(s_card.status, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_set_pos(s_card.status, 16, 140);
+    card_button(box, CARD_W - 96, 150, COL_PURPLE, COL_TEXT, "B", "NO");
+    s_card.btn_a = card_button(box, CARD_W - 52, 138, COL_GREEN, COL_BG, "A", "YES");
+    hint("SELECT = A  yes     CANCEL = B  no");
+    card_update();
+}
+
+static void card_update(void)
+{
+    if (!s_card.box) {
+        return;
+    }
+    const char *name = s_pair.name[0] ? s_pair.name : s_pair.id, *ch = name;
+    while (*ch && !((*ch >= '0' && *ch <= '9') || ((*ch | 32) >= 'a' && (*ch | 32) <= 'z'))) {
+        ch++;                               // "@toly" -> T
+    }
+    char initial[2] = {*ch ? (char)(*ch >= 'a' && *ch <= 'z' ? *ch - 32 : *ch) : '?', 0};
+    lv_label_set_text(s_card.initial, initial);
+    lv_label_set_text(s_card.name, name);
+    lv_label_set_text_fmt(s_card.sub, "Lv %d  " LV_SYMBOL_BULLET "  badge %s", s_pair.level, s_pair.id);
+    bool shown = s_pair.p.state == PAIR_CONFIRM;
+    for (int i = 0; i < 6; i++) {
+        char d[2] = {shown ? s_pair.p.code[i] : '-', 0};
+        lv_label_set_text(s_card.digit[i], d);
+        lv_obj_set_style_text_color(s_card.digit[i], ui_col(shown ? COL_GREEN : COL_DIM), 0);
+    }
+    lv_label_set_text(s_card.status, s_pair.demo ? "Self-test: this is how the code looks."
+                                     : shown ? "Same code on both badges? Then press A."
+                                             : "Waiting. They pick you in Link cable.");
+    lv_obj_set_style_bg_opa(s_card.btn_a, shown ? LV_OPA_COVER : LV_OPA_30, 0);
+}
+
+static void pair_start(const os_mesh_peer_t *p)
+{
+    pair_stop();
+    os_cloud_info_t me;
+    os_cloud_get_info(&me);
+    if (strlen(me.id) != OS_MESH_ID_LEN || !strcmp(me.id, p->id)) {
+        os_toast("This badge has no id yet: connect to Wi-Fi once");
+        return;
+    }
+    snprintf(s_pair.id, sizeof(s_pair.id), "%s", p->id);
+    snprintf(s_pair.name, sizeof(s_pair.name), "%s", p->name);
+    s_pair.level = p->level;
+    s_pair.p.host = strcmp(me.id, p->id) < 0;
+    s_pair.q = xQueueCreate(PAIR_QUEUE, sizeof(pair_msg_t));
+    s_pair.sub = s_pair.q ? os_mesh_subscribe(OS_MESH_APP, pair_heard, NULL) : -1;
+    if (s_pair.sub < 0 || !pair_round(&s_pair.p)) {
+        pair_stop();
+        os_toast("Can't start pairing");
+        return;
+    }
+    link_hold(true);
+    s_view = VIEW_PAIR;
+    card_show();
+    pair_send();
 }
 
 static void show_games(sys_t sys)
@@ -863,6 +1670,14 @@ static void start(sys_t sys, const char *path)
 
 static void enter(lv_obj_t *root)
 {
+    static bool registered;
+    if (!registered) {
+        // The console copied os_cmd's table at boot: register with it directly.
+        const esp_console_cmd_t c = {
+            .command = "retro", .help = "retro selftest - check the link cable's pairing", .func = cmd_retro,
+        };
+        registered = esp_console_cmd_register(&c) == ESP_OK;
+    }
     s_root = root;
     s_list = NULL;
     s_view = VIEW_SYSTEMS;                  // not the view the last session ended in
@@ -884,6 +1699,7 @@ static void enter(lv_obj_t *root)
 
 static void leave(void)
 {
+    pair_stop();                            // the card goes with the root, after this
     if (s_task) {
         s_quit = true;
         // The task saves and exits; it never waits on the LVGL lock we hold here
@@ -947,6 +1763,16 @@ static bool key(os_key_t k, bool repeat)
 {
     if (s_view == VIEW_PLAYING || !s_list) {
         return s_view == VIEW_PLAYING;      // playing: the game reads the buttons, only HOME leaves
+    }
+    if (s_view == VIEW_PAIR) {
+        if (!repeat && k == OS_KEY_SELECT) {
+            pair_accept();
+        } else if (!repeat && k == OS_KEY_BACK) {
+            bool demo = s_pair.demo;
+            pair_stop();
+            demo ? show_systems() : show_link();
+        }
+        return true;
     }
     if (k == OS_KEY_SELECT && !repeat) {
         int i = ui_list_selected(s_list);

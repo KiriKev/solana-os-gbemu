@@ -158,8 +158,13 @@ LINK CABLE: PLAY OR TRADE WITH A FRIEND (Game Boy and Game Boy Color, untested)
   Two badges, both with Retro, can act like a Game Boy link cable over the
   badges' own radio. No cable, router or internet needed.
   1. Both: open Retro, choose "Link cable" (the last row), pick the other badge.
-  2. Both: start a game. A message says "Link cable to ...".
-  3. In the game, go to its 2-player or trade menu, as you would with a cable.
+  2. Both badges show the other's name (its X handle, if linked) and a 6-digit
+     code. Check that both screens show the SAME code, then press SELECT (A).
+     Different codes? Press CANCEL (B): someone may be listening in between.
+     Why: the code comes from a secret only the two badges share. Bytes from
+     any other badge are thrown away, and nobody nearby can read them.
+  3. Both: start a game. A message says "Link cable to ...".
+  4. In the game, go to its 2-player or trade menu, as you would with a cable.
   Both badges need to be close to each other. This hasn't been tried with two
   badges yet, so it may not work with every game.
 
