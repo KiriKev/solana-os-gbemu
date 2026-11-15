@@ -23,7 +23,8 @@
 // Keys (calibrated map): d-pad = d-pad, SELECT = A, CANCEL = B,
 // UP+DOWN = START, LEFT+RIGHT = SELECT (opposite directions never reach a
 // game). BOOT (HOME) leaves the app. Saves: Game Boy cart RAM in <rom>.sav, on
-// quit and every minute while it changes; NES the whole machine in
+// quit and a second after the game last wrote it (at least every minute while
+// it keeps writing); NES the whole machine in
 // <rom>.state, on quit, restored at the next start.
 //
 // Link cable (Game Boy and Game Boy Color): the console list's last row picks a
@@ -72,7 +73,8 @@ static const char *TAG = "retro";
 #define DISP_PRIO       2                   // above the emulator, below LVGL and the OS
 #define GB_FRAME_US     16743               // 59.73 Hz
 #define NES_FRAME_US    16639               // 60.10 Hz (NTSC)
-#define SAVE_EVERY_US   (60 * 1000000LL)
+#define SAVE_QUIET_US   (1000000LL)          // a save is written once the game stopped writing for this long
+#define SAVE_EVERY_US   (60 * 1000000LL)     // or this long after the last one, for games that never stop
 #define ROM_MAX         (4u << 20)
 #define MAX_ROMS        48
 #define PATH_MAX_LEN    200
@@ -101,7 +103,8 @@ typedef struct {
     size_t rom_size;
     uint8_t *ram;                           // Game Boy cart RAM
     size_t ram_size;
-    bool ram_dirty;
+    bool ram_dirty;                         // not on the card yet
+    bool ram_touched;                       // written during this frame
     uint16_t pal[4];                        // big-endian, as the panel takes it
     uint16_t *fb[2];                        // whole frames, PSRAM: the emulator fills fb[back]
     int back;
@@ -209,7 +212,7 @@ static void ram_write(struct gb_s *gb, const uint_fast32_t addr, const uint8_t v
     emu_t *e = gb->direct.priv;
     if (addr < e->ram_size && e->ram[addr] != val) {
         e->ram[addr] = val;
-        e->ram_dirty = true;
+        e->ram_dirty = e->ram_touched = true;
     }
 }
 
@@ -538,7 +541,7 @@ static void emu_task(void *arg)
         goto out;
     }
     const int64_t frame_us = nes ? NES_FRAME_US : GB_FRAME_US;
-    int64_t next = esp_timer_get_time(), last_save = next, stat_t = next;
+    int64_t next = esp_timer_get_time(), last_save = next, last_write = next, stat_t = next;
     int frames = 0, shown = 0, late = 0;
     int64_t busy_sum = 0, busy_max = 0;     // time spent emulating and drawing, the core's real cost
     while (!s_quit) {
@@ -583,7 +586,13 @@ static void emu_task(void *arg)
             frames = shown = late = 0;
             busy_sum = busy_max = 0;
         }
-        if (!nes && e->ram_dirty && now - last_save >= SAVE_EVERY_US) {
+        if (e->ram_touched) {
+            e->ram_touched = false;
+            last_write = now;
+        }
+        // An in-game save reaches the card about a second after the game says
+        // "saved", so switching the badge off then keeps it.
+        if (!nes && e->ram_dirty && (now - last_write >= SAVE_QUIET_US || now - last_save >= SAVE_EVERY_US)) {
             save(e);
             last_save = now;
         }

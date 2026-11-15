@@ -127,3 +127,10 @@ Options: (1) blit 12-row chunks from inside the emulator's draw callback; (2) wh
 Decision: (2). New bsp_display_blit()/bsp_display_blit_wait() in components/bsp: blits share the bus hold (bsp_lcd_hold) with LVGL flushes and SD commands, and a flag keeps flush_done from telling LVGL that its flush finished when the transfer was a blit. The emulator hands a finished frame over only if the display task is idle (else the frame is dropped). Browser emulator gets a synchronous counterpart (not built).
 Evidence: VERIFIED badge console, same game in colour mode: (1) 19.8 fps (the emulator waits on the bus for every chunk); (2) 36.4 fps, repeat 33.2 (spread 28.6-45.7), vs 28.5/27.9 before. Kev confirmed the picture looks right on the badge (position, colours, no stripes). INFERRED: esp_lcd calls on_color_trans_done once per draw_bitmap.
 Revert: git revert this commit.
+
+### DEC-2026-11-15-18: Game Boy saves reach the card a second after the game's last write
+Context: Kev saved in Pokemon (overwrite), switched the badge off, and the save was gone although the game said "saved". Retro wrote cart RAM to <rom>.sav only on quit (BOOT) and at most once a minute, so a power-off within that minute lost the in-game save.
+Options: (1) save when cart RAM was written and then left alone for 1 s, plus the 60 s cap for games that never stop writing; (2) shorter fixed interval (e.g. 5 s); (3) write on every cart RAM write.
+Decision: (1). A per-frame "touched" flag stamps the time of the last write; the emulator task saves once 1 s has passed without one. Costs one 32 KB card write (a short stall) after each in-game save. NES unchanged (whole-machine state, quit only).
+Evidence: VERIFIED badge console after flashing: "21:22:11 retro: saved 32768 B to /sdcard/roms/spiel.sav" and "21:28:33 ... saved 32768 B", each followed by a power cycle (port lost, uptime restarted); Kev: "ok funktionierte" (the save was there after switching on). INFERRED: the earlier loss was a power-off inside the 60 s window; how Kev left the game then was not observed.
+Revert: git revert this commit.
