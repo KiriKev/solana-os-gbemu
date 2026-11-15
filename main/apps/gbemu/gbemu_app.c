@@ -41,8 +41,6 @@
 #include "freertos/queue.h"
 #include "esp_log.h"
 #include "esp_timer.h"
-#include "esp_lvgl_port.h"                  // lvgl_port_lock/unlock, as core/os.c
-#include "lvgl_private.h"                   // lv_image_cache_drop, as core/os.c
 #include "core/os.h"
 #include "core/os_mem.h"
 #include "core/os_mesh.h"
@@ -63,7 +61,15 @@ static const char *TAG = "retro";
 #define NES_W           AGNES_SCREEN_WIDTH
 #define NES_H           OS_ROOT_H           // 218
 #define NES_CROP        ((AGNES_SCREEN_HEIGHT - NES_H) / 2)
-#define BUF_PX          (NES_W * NES_H)     // the bigger picture of the two
+#define GB_X            ((OS_ROOT_W - GB_W) / 2)
+#define GB_Y            (OS_STATUS_H + (OS_ROOT_H - GB_H) / 2)
+#define NES_X           ((OS_ROOT_W - NES_W) / 2)
+#define NES_Y           OS_STATUS_H
+#define CHUNK_LINES     8                   // Game Boy lines per blit: 8 lines -> 12 rows
+#define CHUNK_ROWS      12                  // screen rows per blit
+#define CHUNK_PX        (NES_W * CHUNK_ROWS) // the wider picture of the two
+#define FRAME_PX        (NES_W * NES_H)     // the bigger picture of the two
+#define DISP_PRIO       2                   // above the emulator, below LVGL and the OS
 #define GB_FRAME_US     16743               // 59.73 Hz
 #define NES_FRAME_US    16639               // 60.10 Hz (NTSC)
 #define SAVE_EVERY_US   (60 * 1000000LL)
@@ -71,7 +77,6 @@ static const char *TAG = "retro";
 #define MAX_ROMS        48
 #define PATH_MAX_LEN    200
 #define SRAM_KEEP       (64 * 1024)         // SRAM left for Wi-Fi, LVGL, stacks before the core may take some
-#define LOCK_WAIT_MS    4                   // how long a frame waits for LVGL to finish a redraw
 
 typedef enum { SYS_GB, SYS_GBC, SYS_NES, SYS_COUNT } sys_t;
 
@@ -97,9 +102,16 @@ typedef struct {
     uint8_t *ram;                           // Game Boy cart RAM
     size_t ram_size;
     bool ram_dirty;
-    uint16_t pal[4];
-    uint16_t *buf[2];                       // [front, back]; the image shows buf[0]
-    bool drawn;                             // a whole frame reached the back buffer
+    uint16_t pal[4];                        // big-endian, as the panel takes it
+    uint16_t *fb[2];                        // whole frames, PSRAM: the emulator fills fb[back]
+    int back;
+    volatile int show;                      // the frame the display task sends
+    volatile bool disp_busy;                // it's still sending it
+    bool drawn;                             // a frame was handed over
+    uint16_t *chunk[2];                     // blit buffers, internal DMA RAM; one fills while the other is sent
+    int x, y, w, h;                         // where the picture goes on the screen
+    TaskHandle_t disp;
+    SemaphoreHandle_t disp_done;
     char rom_path[PATH_MAX_LEN];
     char sav_path[PATH_MAX_LEN];            // <rom>.sav or <rom>.state
     // The task's own handles: if it ever outlives leave()'s wait, leave() forgets
@@ -150,8 +162,7 @@ static emu_t *s_emu;
 static TaskHandle_t s_task;
 static SemaphoreHandle_t s_done;
 static volatile bool s_quit;
-static lv_image_dsc_t s_dsc[2];
-static lv_obj_t *s_root, *s_img, *s_msg, *s_hint;
+static lv_obj_t *s_root, *s_msg, *s_hint;
 static ui_list_t *s_list;
 static view_t s_view;
 static sys_t s_sys;
@@ -292,41 +303,81 @@ static void link_hold(bool on)
     }
 }
 
-// Line y of 144 into rows of the 240x216 back buffer: even lines fill two rows,
-// odd lines one (0 -> 0,1; 1 -> 2; 2 -> 3,4 ...). Columns: 2 pixels -> 3.
-// Colour games index the core's RGB565 palette; others get the 4 shades.
+// A whole frame is in fb[back]: hand it to the display task, unless it's
+// still sending the last one (then this frame is dropped and drawn over).
+static void hand_off(emu_t *e)
+{
+    if (e->disp_busy) {
+        return;
+    }
+    e->show = e->back;
+    e->back ^= 1;
+    e->disp_busy = true;
+    e->drawn = true;
+    xTaskNotifyGive(e->disp);
+}
+
+// Display task: copies the shown frame to the panel 12 rows at a time. Each
+// blit waits only for the chunk before it, and the emulator runs meanwhile.
+static void disp_task(void *arg)
+{
+    emu_t *e = arg;
+    int cur = 0;
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        if (s_quit) {
+            break;
+        }
+        const uint16_t *src = e->fb[e->show];
+        for (int y0 = 0; y0 < e->h; y0 += CHUNK_ROWS) {
+            int rows = e->h - y0 < CHUNK_ROWS ? e->h - y0 : CHUNK_ROWS;
+            memcpy(e->chunk[cur], src + y0 * e->w, rows * e->w * sizeof(uint16_t));
+            bsp_display_blit(e->x, e->y + y0, e->x + e->w, e->y + y0 + rows, e->chunk[cur]);
+            cur ^= 1;
+        }
+        e->disp_busy = false;
+    }
+    bsp_display_blit_wait();
+    xSemaphoreGive(e->disp_done);
+    vTaskDelete(NULL);
+}
+
+// Line y of 144 into rows of the 240x216 frame: even lines fill two rows, odd
+// lines one (0 -> 0,1; 1 -> 2; 2 -> 3,4 ...); 2 pixels -> 3 columns.
+// Big-endian, as the panel takes it. Colour games index the core's RGB565
+// palette; others get the 4 shades.
 static void draw_line(struct gb_s *gb, const uint8_t *px, const uint_fast8_t y)
 {
     emu_t *e = gb->direct.priv;
     const uint16_t *cgb = gb->cgb.cgbMode ? gb->cgb.fixPalette : NULL;
     int row = (y & 1) ? (3 * y + 1) / 2 : 3 * y / 2;
-    uint16_t *dst = e->buf[1] + row * GB_W;
+    uint16_t *start = e->fb[e->back] + row * GB_W, *dst = start;
     for (int x = 0; x < LCD_WIDTH; x += 2) {
-        uint16_t a = cgb ? cgb[px[x] & 0x3F] : e->pal[px[x] & 3];
-        uint16_t b = cgb ? cgb[px[x + 1] & 0x3F] : e->pal[px[x + 1] & 3];
+        uint16_t a = cgb ? __builtin_bswap16(cgb[px[x] & 0x3F]) : e->pal[px[x] & 3];
+        uint16_t b = cgb ? __builtin_bswap16(cgb[px[x + 1] & 0x3F]) : e->pal[px[x + 1] & 3];
         *dst++ = a;
         *dst++ = a;
         *dst++ = b;
     }
     if (!(y & 1)) {
-        memcpy(e->buf[1] + (row + 1) * GB_W, e->buf[1] + row * GB_W, GB_W * sizeof(uint16_t));
+        memcpy(start + GB_W, start, GB_W * sizeof(uint16_t));
     }
     if (y == LCD_HEIGHT - 1) {
-        e->drawn = true;
+        hand_off(e);
     }
 }
 
-// The NES picture, rows NES_CROP.. of 240, into the back buffer.
+// The NES picture, rows NES_CROP.. of 240, into the frame.
 static void nes_draw(emu_t *e)
 {
-    uint16_t *dst = e->buf[1];
+    uint16_t *dst = e->fb[e->back];
     for (int y = 0; y < NES_H; y++) {
         for (int x = 0; x < NES_W; x++) {
             agnes_color_t c = agnes_get_screen_pixel(e->nes, x, y + NES_CROP);
-            *dst++ = rgb565(c.r, c.g, c.b);
+            *dst++ = __builtin_bswap16(rgb565(c.r, c.g, c.b));
         }
     }
-    e->drawn = true;
+    hand_off(e);
 }
 
 // ---- Files (emulator task) ----
@@ -418,25 +469,6 @@ static void nes_input(emu_t *e, uint8_t held)
 
 // ---- Emulator task ----
 
-// Show the back buffer: swap under the LVGL lock, or keep drawing into the same
-// back buffer and try again next frame if LVGL is mid-redraw.
-static bool present(emu_t *e)
-{
-    if (!lvgl_port_lock(LOCK_WAIT_MS)) {
-        return false;
-    }
-    if (!s_quit && s_img) {
-        uint16_t *t = e->buf[0];
-        e->buf[0] = e->buf[1];
-        e->buf[1] = t;
-        lv_image_dsc_t *d = s_dsc[0].data == (const uint8_t *)e->buf[0] ? &s_dsc[0] : &s_dsc[1];
-        lv_image_cache_drop(d);
-        lv_image_set_src(s_img, d);
-    }
-    lvgl_port_unlock();
-    return true;
-}
-
 static bool start_gb(emu_t *e)
 {
     enum gb_init_error_e ie = gb_init(&e->gb, rom_read, rom_read16, rom_read32, ram_read, ram_write, gb_err, e);
@@ -527,7 +559,7 @@ static void emu_task(void *arg)
         busy_max = busy > busy_max ? busy : busy_max;
         if (e->drawn) {
             e->drawn = false;
-            shown += present(e);
+            shown++;
         }
         int64_t now = esp_timer_get_time();
         next += frame_us;
@@ -756,9 +788,13 @@ static void start(sys_t sys, const char *path)
         e = heap_caps_calloc(1, sizeof(*e), os_mem_bulk_caps());
     }
     for (int i = 0; e && i < 2; i++) {
-        e->buf[i] = heap_caps_calloc(BUF_PX, sizeof(uint16_t), os_mem_bulk_caps());
-        if (!e->buf[i]) {
-            heap_caps_free(e->buf[0]);
+        e->chunk[i] = heap_caps_malloc(CHUNK_PX * sizeof(uint16_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        e->fb[i] = heap_caps_calloc(FRAME_PX, sizeof(uint16_t), os_mem_bulk_caps());
+        if (!e->chunk[i] || !e->fb[i]) {
+            heap_caps_free(e->chunk[0]);
+            heap_caps_free(e->chunk[1]);
+            heap_caps_free(e->fb[0]);
+            heap_caps_free(e->fb[1]);
             heap_caps_free(e);
             e = NULL;
         }
@@ -773,26 +809,18 @@ static void start(sys_t sys, const char *path)
     char *dot = strrchr(e->sav_path, '.');
     snprintf(dot, sizeof(e->sav_path) - (dot - e->sav_path), nes ? ".state" : ".sav");
     for (int i = 0; i < 4; i++) {
-        e->pal[i] = lv_color_to_u16(lv_color_hex(DMG_HEX[i]));
+        e->pal[i] = __builtin_bswap16(lv_color_to_u16(lv_color_hex(DMG_HEX[i])));
     }
-    int w = nes ? NES_W : GB_W, h = nes ? NES_H : GB_H;
-    for (int i = 0; i < 2; i++) {
-        s_dsc[i] = (lv_image_dsc_t){
-            .header = {.magic = LV_IMAGE_HEADER_MAGIC, .cf = LV_COLOR_FORMAT_RGB565,
-                       .w = w, .h = h, .stride = w * 2},
-            .data_size = w * h * 2,
-            .data = (const uint8_t *)e->buf[i],
-        };
-    }
-
     ui_list_show(s_list, false);
     hint(NULL);
     s_view = VIEW_PLAYING;
     lv_obj_set_style_bg_color(s_root, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(s_root, LV_OPA_COVER, 0);
-    s_img = lv_image_create(s_root);
-    lv_image_set_src(s_img, &s_dsc[0]);
-    lv_obj_align(s_img, LV_ALIGN_CENTER, 0, 0);
+    // The game draws itself over this black root (bsp_display_blit), past LVGL.
+    e->x = nes ? NES_X : GB_X;
+    e->y = nes ? NES_Y : GB_Y;
+    e->w = nes ? NES_W : GB_W;
+    e->h = nes ? NES_H : GB_H;
 
     if (!nes && s_link_id[0]) {
         s_link_seq = s_link_last = 0;
@@ -803,6 +831,12 @@ static void start(sys_t sys, const char *path)
 
     s_emu = e;
     s_quit = false;
+    e->disp_done = xSemaphoreCreateBinary();
+    if (!e->disp_done || xTaskCreate(disp_task, "retro_disp", 3072, e, DISP_PRIO, &e->disp) != pdPASS) {
+        os_toast("Can't start the display task");    // leave() frees what start() made
+        e->disp = NULL;
+        return;
+    }
     s_done = xSemaphoreCreateBinary();
     e->done = s_done;
     e->link_q = s_link_sub >= 0 ? s_link_q : NULL;
@@ -823,7 +857,7 @@ static void enter(lv_obj_t *root)
     s_root = root;
     s_list = NULL;
     s_view = VIEW_SYSTEMS;                  // not the view the last session ended in
-    s_msg = s_img = s_hint = NULL;
+    s_msg = s_hint = NULL;
     s_task = NULL;
 
     bsp_sd_info_t in;
@@ -844,7 +878,7 @@ static void leave(void)
     if (s_task) {
         s_quit = true;
         // The task saves and exits; it never waits on the LVGL lock we hold here
-        // (present() gives up after LOCK_WAIT_MS and sees s_quit).
+        // (blits only wait for the panel, never for LVGL).
         if (xSemaphoreTake(s_done, pdMS_TO_TICKS(3000)) != pdTRUE) {
             // Still running: leak its state and the handles it holds (its own
             // copies in emu_t), rather than free what it may still touch.
@@ -878,12 +912,25 @@ static void leave(void)
         }
         heap_caps_free(s_emu->rom);
         heap_caps_free(s_emu->ram);
-        heap_caps_free(s_emu->buf[0]);
-        heap_caps_free(s_emu->buf[1]);
+        if (s_emu->disp) {
+            xTaskNotifyGive(s_emu->disp);   // s_quit is set: it finishes its frame and stops
+            if (xSemaphoreTake(s_emu->disp_done, pdMS_TO_TICKS(1000)) != pdTRUE) {
+                ESP_LOGW(TAG, "display task did not stop; leaking the frame state");
+                s_emu = NULL;
+            }
+        }
+    }
+    if (s_emu) {
+        if (s_emu->disp_done) {
+            vSemaphoreDelete(s_emu->disp_done);
+        }
+        heap_caps_free(s_emu->chunk[0]);
+        heap_caps_free(s_emu->chunk[1]);
+        heap_caps_free(s_emu->fb[0]);
+        heap_caps_free(s_emu->fb[1]);
         heap_caps_free(s_emu);
         s_emu = NULL;
     }
-    s_img = NULL;
     s_hint = NULL;
 }
 

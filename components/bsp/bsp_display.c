@@ -19,6 +19,7 @@ static const char *TAG = "bsp_display";
 static SemaphoreHandle_t s_lcd_idle;    // see bsp_bus.h
 static esp_lcd_panel_handle_t s_panel;
 static bool s_inverted;
+static volatile bool s_blit;            // the transfer in flight is a bsp_display_blit(), not an LVGL flush
 
 void bsp_lcd_hold(void)
 {
@@ -83,9 +84,36 @@ static void merge_dirty(lv_event_t *e)
 static bool flush_done(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t *edata, void *ctx)
 {
     BaseType_t woken = pdFALSE;
-    lv_display_flush_ready(ctx);
+    if (s_blit) {
+        s_blit = false;                 // a blit: LVGL isn't waiting for it, don't tell it its flush is done
+    } else {
+        lv_display_flush_ready(ctx);
+    }
     xSemaphoreGiveFromISR(s_lcd_idle, &woken);
     return woken == pdTRUE;
+}
+
+// The hold (bsp_bus.h) orders blits and LVGL flushes, so the flag always
+// belongs to the one transfer in flight; flush_done gives the hold back.
+esp_err_t bsp_display_blit(int x0, int y0, int x1, int y1, const void *data)
+{
+    if (!s_panel || !s_lcd_idle) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    bsp_lcd_hold();
+    s_blit = true;
+    esp_err_t err = esp_lcd_panel_draw_bitmap(s_panel, x0, y0, x1, y1, data);
+    if (err != ESP_OK) {
+        s_blit = false;
+        bsp_lcd_release();
+    }
+    return err;
+}
+
+void bsp_display_blit_wait(void)
+{
+    bsp_lcd_hold();
+    bsp_lcd_release();
 }
 
 // The backlight pin is PWM'd by LEDC so the screen can dim (Settings >

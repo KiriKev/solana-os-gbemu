@@ -53,6 +53,14 @@ uint8_t bsp_backlight_get_level(void);
 // Any task but the LVGL task's flush path.
 void bsp_display_invert(bool on);
 bool bsp_display_inverted(void);
+// Draw big-endian RGB565 pixels straight to the panel, bypassing LVGL, for
+// apps that redraw a region every frame (Retro). x1/y1 exclusive, landscape
+// screen coordinates. Waits for the transfer before it (an LVGL flush or a
+// blit), then queues this one by DMA and returns: `data` must be DMA-capable
+// internal RAM and stay untouched until the next blit or blit_wait returns.
+// LVGL may still repaint the region (toasts); the next blit draws over it.
+esp_err_t bsp_display_blit(int x0, int y0, int x1, int y1, const void *data);
+void bsp_display_blit_wait(void);   // until the last blit has left the buffer
 
 // ---- Buttons ----
 #define BSP_BTN_PB(n)   (1u << ((n) - 1))   // n = 1..6

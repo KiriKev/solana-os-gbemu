@@ -118,6 +118,30 @@ bool bsp_display_inverted(void)
     return s_inverted;
 }
 
+// Big-endian RGB565 straight into the page's framebuffer, as the badge's
+// panel would show it. Synchronous, so there is nothing to wait for.
+esp_err_t bsp_display_blit(int x0, int y0, int x1, int y1, const void *data)
+{
+    const uint8_t *p = data;
+    for (int y = y0; y < y1; y++) {
+        uint32_t *dst = &s_fb[y * BOARD_LCD_H_RES + x0];
+        for (int x = x0; x < x1; x++, p += 2) {
+            uint32_t c = (uint32_t)p[0] << 8 | p[1];
+            uint32_t r = (c >> 11) & 0x1F, g = (c >> 5) & 0x3F, b = c & 0x1F;
+            r = (r << 3) | (r >> 2);
+            g = (g << 2) | (g >> 4);
+            b = (b << 3) | (b >> 2);
+            *dst++ = 0xFF000000u | (b << 16) | (g << 8) | r;
+        }
+    }
+    s_frame++;
+    return ESP_OK;
+}
+
+void bsp_display_blit_wait(void)
+{
+}
+
 lv_display_t *bsp_display_start(void)
 {
     bsp_backlight(false);

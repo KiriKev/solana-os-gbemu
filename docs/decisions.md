@@ -120,3 +120,10 @@ Options and results (median emulated fps, target 59.7):
 Decision: keep none of the core/memory variants (all within noise, or cost colour). The only large measured lever is the display (+39 % with it off), so the next step is drawing frames to the panel directly instead of through LVGL. Even with a free display the emulation alone measured ~40 fps, so full speed is not expected on this chip with these cores.
 Evidence: VERIFIED, the numbers above from the badge console (scratchpad measure.py, trial.ps1). Run-to-run spread is about ±1.5 fps (min/max per run in the session log).
 Revert: n/a (no code change kept).
+
+### DEC-2026-11-15-17: Retro draws to the panel directly through a display task
+Context: DEC-16 measured the display as the only large lever (39.6 fps with it off vs 28.5). Frames went through an LVGL image: LVGL re-rendered each frame into its draw buffers on the same core.
+Options: (1) blit 12-row chunks from inside the emulator's draw callback; (2) whole frames into PSRAM, a separate display task (priority 2, above the emulator) copies them into two internal DMA chunks and blits them; (3) keep LVGL.
+Decision: (2). New bsp_display_blit()/bsp_display_blit_wait() in components/bsp: blits share the bus hold (bsp_lcd_hold) with LVGL flushes and SD commands, and a flag keeps flush_done from telling LVGL that its flush finished when the transfer was a blit. The emulator hands a finished frame over only if the display task is idle (else the frame is dropped). Browser emulator gets a synchronous counterpart (not built).
+Evidence: VERIFIED badge console, same game in colour mode: (1) 19.8 fps (the emulator waits on the bus for every chunk); (2) 36.4 fps, repeat 33.2 (spread 28.6-45.7), vs 28.5/27.9 before. Kev confirmed the picture looks right on the badge (position, colours, no stripes). INFERRED: esp_lcd calls on_color_trans_done once per draw_bitmap.
+Revert: git revert this commit.
