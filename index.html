@@ -5,54 +5,142 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Retro Installer</title>
 <meta name="description" content="Put Retro (Game Boy, Game Boy Color, NES) on your Solana Breakpoint badge and copy your games, from the browser.">
+<meta name="theme-color" content="#000000">
 <style>
+  /* The badge's own tones (main/core/theme.h); the page is dark like the badge. */
   :root {
-    --bg: #f6f6f4; --card: #ffffff; --text: #1b1b1f; --dim: #5d5d66; --line: #e2e2e6;
-    --accent: #0f7b5f; --accent-text: #ffffff; --ok: #0f7b5f; --error: #b3261e; --code: #f0f0ee;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #111114; --card: #1b1b20; --text: #ececf1; --dim: #a3a3ad; --line: #2c2c33;
-      --accent: #2fc28f; --accent-text: #0b1d16; --ok: #2fc28f; --error: #ff8a80; --code: #24242a;
-    }
+    color-scheme: dark;
+    --bg: #000000; --panel: #111116; --panel-hi: #1C1B26; --line: #2A2935;
+    --text: #FFFFFF; --dim: #8E8C9E; --purple: #9945FF; --lpurple: #B6B0FF; --green: #14F195; --orange: #FF754A;
+    --purple-deep: color-mix(in srgb, var(--purple) 55%, #000);   /* the button's hard shadow */
+    --mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   }
   * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--text);
-         font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-  main { max-width: 720px; margin: 0 auto; padding: 32px 16px 64px; }
-  h1 { font-size: 28px; line-height: 1.2; margin: 0 0 8px; }
-  h2 { font-size: 19px; margin: 0 0 4px; }
+  body {
+    margin: 0; color: var(--text); font: 16px/1.6 var(--sans);
+    /* a faint pixel grid, like a handheld's screen up close */
+    background-color: var(--bg);
+    background-image:
+      linear-gradient(var(--panel) 1px, transparent 1px),
+      linear-gradient(90deg, var(--panel) 1px, transparent 1px);
+    background-size: 8px 8px;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1, h2, .step, .tag, summary, button, .filebtn { font-family: var(--mono); }
+  h2 { font-size: 18px; letter-spacing: .04em; text-transform: uppercase; margin: 0 0 6px; }
   p { margin: 8px 0; }
-  .lead { color: var(--dim); margin-bottom: 24px; }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px; margin: 16px 0; }
-  .step { display: inline-block; font-size: 13px; font-weight: 600; color: var(--accent); margin-bottom: 4px; }
+  a { color: var(--lpurple); text-underline-offset: 3px; }
+  strong { color: var(--text); }
+  :focus-visible { outline: 2px solid var(--lpurple); outline-offset: 3px; }
+
+  /* Header: the body of a Game Boy Color, in Solana colours. */
+  .console {
+    background: var(--panel-hi); border: 2px solid var(--line); border-radius: 18px 18px 48px 18px;
+    padding: 18px 20px 22px; margin-bottom: 20px;
+  }
+  .stripe { height: 6px; border-radius: 3px; background: linear-gradient(90deg, var(--purple), var(--green)); }
+  .power { display: flex; align-items: center; gap: 8px; margin: 10px 0 14px; font: 12px var(--mono);
+           color: var(--dim); letter-spacing: .12em; }
+  .power i { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .screen {
+    background: var(--bg); border: 3px solid var(--purple); border-radius: 10px; padding: 20px;
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  }
+  h1 { margin: 0; font-size: clamp(34px, 9vw, 56px); line-height: 1; letter-spacing: .08em;
+       color: var(--text); text-shadow: 3px 3px 0 var(--purple); }
+  .screen p { margin: 10px 0 0; color: var(--dim); max-width: 34ch; }
+  .pad { display: flex; gap: 10px; align-items: flex-end; flex: none; }
+  .ab { width: 40px; height: 40px; border-radius: 50%; display: grid; place-items: center;
+        font: 700 16px var(--mono); }
+  .ab.b { background: var(--purple); color: var(--text); margin-bottom: 0; }
+  .ab.a { background: var(--green); color: var(--bg); margin-bottom: 18px; }
+  @media (max-width: 480px) { .pad { display: none; } }
+
+  /* Cards: cartridge labels, the top-right corner cut off. */
+  .card {
+    position: relative; background: var(--panel); border: 2px solid var(--line); padding: 20px; margin: 16px 0;
+    clip-path: polygon(0 0, calc(100% - 18px) 0, 100% 18px, 100% 100%, 0 100%);
+  }
+  .card::after {   /* the cut corner's edge */
+    content: ""; position: absolute; top: -2px; right: -2px; width: 25px; height: 2px; background: var(--line);
+    transform: translate(-5px, 9px) rotate(45deg);
+  }
+  .step {
+    display: inline-block; font-size: 12px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase;
+    color: var(--bg); background: var(--lpurple); padding: 2px 8px; margin-bottom: 10px;
+  }
+  .step.opt { background: var(--panel-hi); color: var(--lpurple); outline: 1px solid var(--lpurple); }
+  .warn { border-color: var(--orange); }
   ol, ul { padding-left: 22px; margin: 8px 0; }
   li { margin: 4px 0; }
-  button, .filebtn { font: inherit; font-weight: 600; border-radius: 8px; padding: 10px 16px; cursor: pointer; }
-  button.primary { background: var(--accent); color: var(--accent-text); border: 0; }
-  button:disabled, .filebtn[aria-disabled=true] { opacity: .5; cursor: not-allowed; }
-  .filebtn { display: inline-block; border: 1px solid var(--line); background: transparent; color: var(--text); }
-  .filebtn input { display: none; }
-  .row { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
-  progress { width: 100%; height: 10px; margin-top: 12px; accent-color: var(--accent); }
-  .status { margin-top: 10px; min-height: 1.5em; color: var(--dim); }
-  .status[data-kind=ok] { color: var(--ok); font-weight: 600; }
-  .status[data-kind=error] { color: var(--error); font-weight: 600; }
-  #plan { font: 13px/1.5 ui-monospace, Consolas, monospace; max-height: 180px; overflow: auto; color: var(--dim); }
-  code { background: var(--code); padding: 1px 5px; border-radius: 4px; font-size: 14px; }
-  pre.tree { background: var(--code); padding: 10px 12px; border-radius: 8px; font-size: 14px; overflow-x: auto; margin: 8px 0; }
-  .warn { border-color: var(--error); }
-  details { margin-top: 16px; color: var(--dim); }
-  #log { white-space: pre-wrap; font: 12px/1.4 ui-monospace, Consolas, monospace; max-height: 240px; overflow: auto;
-         background: var(--code); padding: 10px; border-radius: 8px; }
-  footer { color: var(--dim); font-size: 14px; margin-top: 32px; }
-  a { color: var(--accent); }
+  li::marker { color: var(--purple); }
+
+  /* Buttons: chunky, pressed down like a console button. */
+  .row { display: flex; flex-wrap: wrap; gap: 12px; margin: 14px 0 4px; }
+  button, .filebtn {
+    font-size: 15px; font-weight: 700; letter-spacing: .03em; min-height: 44px; padding: 10px 18px;
+    border-radius: 6px; cursor: pointer; display: inline-flex; align-items: center;
+  }
+  button.primary { background: var(--purple); color: var(--text); border: 0; box-shadow: 0 4px 0 var(--purple-deep); }
+  .filebtn { background: var(--panel-hi); color: var(--lpurple); border: 2px solid var(--line); box-shadow: 0 4px 0 #000; }
+  .filebtn:focus-within { outline: 2px solid var(--lpurple); outline-offset: 3px; }
+  .filebtn input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+  button.primary:hover { filter: brightness(1.12); }
+  .filebtn:hover { border-color: var(--lpurple); }
+  button.primary:active, .filebtn:active { transform: translateY(3px); box-shadow: 0 1px 0 var(--purple-deep); }
+  button:disabled, .filebtn:has(input:disabled) { opacity: .45; cursor: not-allowed; transform: none; }
+  @media (prefers-reduced-motion: no-preference) {
+    button, .filebtn { transition: transform .08s ease-out, box-shadow .08s ease-out, background-color .15s, border-color .15s; }
+  }
+
+  /* Progress: a row of blocks. */
+  progress { appearance: none; width: 100%; height: 14px; margin-top: 14px; border: 2px solid var(--line);
+             background: var(--bg); }
+  progress::-webkit-progress-bar { background: var(--bg); }
+  progress::-webkit-progress-value {
+    background: repeating-linear-gradient(90deg, var(--green) 0 10px, transparent 10px 12px);
+  }
+  progress::-moz-progress-bar { background: repeating-linear-gradient(90deg, var(--green) 0 10px, transparent 10px 12px); }
+
+  .status { margin-top: 10px; min-height: 1.6em; color: var(--dim); font-family: var(--mono); font-size: 14px; }
+  .status[data-kind=ok] { color: var(--green); font-weight: 700; }
+  .status[data-kind=error] { color: var(--orange); font-weight: 700; }
+  #plan { font: 13px/1.5 var(--mono); max-height: 180px; overflow: auto; color: var(--dim); }
+  code, kbd { font-family: var(--mono); background: var(--panel-hi); border: 1px solid var(--line);
+              padding: 1px 6px; border-radius: 4px; font-size: 14px; color: var(--text); }
+  pre.tree { background: var(--bg); color: var(--green); border: 2px solid var(--line); padding: 12px 14px;
+             font: 14px/1.5 var(--mono); overflow-x: auto; margin: 10px 0; }
+
+  /* Controls, as the badge's buttons. */
+  .keys { list-style: none; padding: 0; display: grid; gap: 8px; }
+  .keys li { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+  .dot { width: 24px; height: 24px; border-radius: 50%; display: inline-grid; place-items: center;
+         font: 700 12px var(--mono); }
+  .dot.a { background: var(--green); color: var(--bg); }
+  .dot.b { background: var(--purple); color: var(--text); }
+  .tag { font-size: 12px; color: var(--lpurple); letter-spacing: .08em; text-transform: uppercase; }
+
+  details { margin-top: 20px; color: var(--dim); }
+  summary { cursor: pointer; min-height: 40px; display: flex; align-items: center; }
+  #log { white-space: pre-wrap; font: 12px/1.4 var(--mono); max-height: 240px; overflow: auto;
+         background: var(--panel); border: 1px solid var(--line); padding: 10px; }
+  footer { color: var(--dim); font-size: 14px; margin-top: 32px; border-top: 2px dashed var(--line); padding-top: 16px; }
 </style>
 </head>
 <body>
 <main>
-  <h1>Retro for your Solana badge</h1>
-  <p class="lead">Play Game Boy, Game Boy Color and NES games on your Breakpoint 2026 badge. Two clicks, nothing to install on your computer.</p>
+  <header class="console">
+    <div class="stripe" aria-hidden="true"></div>
+    <div class="power" aria-hidden="true"><i></i>POWER</div>
+    <div class="screen">
+      <div>
+        <h1>RETRO</h1>
+        <p>Game Boy, Game Boy Color and NES games on your Breakpoint 2026 badge. Two clicks, nothing to install on your computer.</p>
+      </div>
+      <div class="pad" aria-hidden="true"><span class="ab b">B</span><span class="ab a">A</span></div>
+    </div>
+  </header>
 
   <div class="card warn" id="unsupported" hidden>
     <strong>This browser can't talk to the badge.</strong> Open this page in Chrome or Edge on a computer (Windows, Mac or Linux).
@@ -68,7 +156,7 @@
   </div>
 
   <div class="card">
-    <span class="step">Step 1 (recommended)</span>
+    <span class="step opt">Step 1 &middot; recommended</span>
     <h2>Back up your badge</h2>
     <p>Saves everything on your badge (system, apps, settings, badge identity) as one 16 MB file on your computer, so you can go back to exactly this state later. Takes about 10-15 minutes.</p>
     <div class="row"><button class="primary" id="backup">Back up badge</button></div>
@@ -108,12 +196,13 @@
     <span class="step">Step 4</span>
     <h2>Play</h2>
     <p>On the badge: open <strong>Retro</strong>, pick the console, pick the game, press SELECT.</p>
-    <ul>
-      <li>SELECT = A, CANCEL = B</li>
-      <li>UP + DOWN together = START, LEFT + RIGHT together = SELECT</li>
-      <li>BOOT (on the back) = quit. Your game is saved.</li>
+    <ul class="keys">
+      <li><kbd>SELECT</kbd> = <span class="dot a" aria-label="A">A</span> <kbd>CANCEL</kbd> = <span class="dot b" aria-label="B">B</span></li>
+      <li><kbd>UP</kbd> + <kbd>DOWN</kbd> together = START, <kbd>LEFT</kbd> + <kbd>RIGHT</kbd> together = SELECT</li>
+      <li><kbd>BOOT</kbd> (on the back) = quit. Your game is saved.</li>
     </ul>
-    <p>Early test build: Game Boy and Game Boy Color run at about half speed, NES is very slow.</p>
+    <p><span class="tag">Link cable</span> Trade or play with a friend: both pick each other under Link cable, check that both screens show the same 6-digit code, then press A.</p>
+    <p><span class="tag">Early test build</span> Game Boy and Game Boy Color run at about half speed, NES is very slow.</p>
   </div>
 
   <div class="card">
