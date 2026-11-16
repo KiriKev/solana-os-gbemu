@@ -94,6 +94,17 @@
     button, .filebtn { transition: transform .08s ease-out, box-shadow .08s ease-out, background-color .15s, border-color .15s; }
   }
 
+  /* Console choice: the picked one lit. */
+  .consoles { border: 0; padding: 0; margin: 10px 0 4px; display: flex; flex-wrap: wrap; gap: 8px; }
+  .consoles legend { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  .consoles label { position: relative; cursor: pointer; }
+  .consoles input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+  .consoles span { display: inline-flex; align-items: center; min-height: 40px; padding: 8px 14px; border-radius: 6px;
+                   font: 700 14px var(--mono); color: var(--dim); background: var(--bg); border: 2px solid var(--line); }
+  .consoles input:checked + span { color: var(--bg); background: var(--green); border-color: var(--green); }
+  .consoles input:focus-visible + span { outline: 2px solid var(--lpurple); outline-offset: 3px; }
+  .consoles input:disabled + span { opacity: .45; cursor: not-allowed; }
+
   /* Progress: a row of blocks. */
   progress { appearance: none; width: 100%; height: 14px; margin-top: 14px; border: 2px solid var(--line);
              background: var(--bg); }
@@ -181,9 +192,19 @@
   gb/    Game Boy games (.gb)
   gbc/   Game Boy Color games (.gbc)
   nes/   NES games (.nes)</pre>
-    <p>Then choose that <code>roms</code> folder (or just pick some game files), and click <strong>Copy to badge</strong>. About 2 minutes per 1 MB.</p>
+    <p>Then choose that <code>roms</code> folder, and click <strong>Copy to badge</strong>. About 2 minutes per 1 MB.</p>
     <div class="row">
       <label class="filebtn">Choose roms folder<input type="file" id="folder" webkitdirectory multiple></label>
+    </div>
+    <p>Or pick single games, and which console they're for:</p>
+    <fieldset class="consoles">
+      <legend>Console for single games</legend>
+      <label><input type="radio" name="console" value="" checked><span>By file ending</span></label>
+      <label><input type="radio" name="console" value="gb"><span>Game Boy</span></label>
+      <label><input type="radio" name="console" value="gbc"><span>Game Boy Color</span></label>
+      <label><input type="radio" name="console" value="nes"><span>NES</span></label>
+    </fieldset>
+    <div class="row">
       <label class="filebtn">Choose game files<input type="file" id="files" multiple accept=".gb,.gbc,.nes"></label>
       <button class="primary" id="copy" disabled>Copy to badge</button>
     </div>

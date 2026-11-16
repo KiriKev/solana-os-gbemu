@@ -14,14 +14,16 @@ export function cardName(name, ext) {
   return base;
 }
 
-export function planFiles(fileList) {
+// Where each file goes on the card. `console` ("gb", "gbc" or "nes") puts
+// them all in that console's folder; without it the folder they're in decides
+// (roms/gbc/...), else the file ending.
+export function planFiles(fileList, console = null) {
   const used = new Set();
   const out = [], skipped = [];
   for (const f of fileList) {
     const ext = (f.name.match(/\.[^.]+$/) || [""])[0].toLowerCase();
     const dirs = (f.webkitRelativePath || "").toLowerCase().split("/").slice(0, -1);
-    // The folder decides (roms/gbc/...), else the file ending.
-    let sys = Object.keys(SYSTEMS).find((s) => dirs.includes(s));
+    let sys = SYSTEMS[console] ? console : Object.keys(SYSTEMS).find((s) => dirs.includes(s));
     if (!sys) sys = Object.keys(SYSTEMS).find((s) => SYSTEMS[s] === ext);
     const fits = sys && (sys === "nes" ? ext === ".nes" : ext === ".gb" || ext === ".gbc");
     if (!fits) {
@@ -35,6 +37,16 @@ export function planFiles(fileList) {
     out.push({ file: f, dest: `roms/${sys}/${name}` });
   }
   return { out, skipped };
+}
+
+// Restarts the chip into its own firmware (esptool-js 0.7.0's "hard_reset"
+// only ever turns RTS off, so the chip stays in its loader). The badge's
+// USB-serial chip: RTS on = reset held, DTR on = boot into the loader.
+export async function restartBadge(transport, wait = (ms) => new Promise((r) => setTimeout(r, ms))) {
+  await transport.setDTR(false);
+  await transport.setRTS(true);
+  await wait(100);
+  await transport.setRTS(false);
 }
 
 // The badge console over Web Serial: a text buffer and "wait for this pattern".

@@ -4,7 +4,7 @@
 import { createHash } from "node:crypto";
 
 const mod = process.env.PROTOCOL_URL || new URL("./protocol.js", import.meta.url).href;
-const { planFiles, BadgeConsole, sendFile, isBadgeBackup, readWholeFlash } = await import(mod);
+const { planFiles, BadgeConsole, sendFile, isBadgeBackup, readWholeFlash, restartBadge } = await import(mod);
 const { md5 } = await import(new URL("./md5.js", import.meta.url).href);
 
 let failed = 0, passed = 0;
@@ -88,6 +88,28 @@ const f = (name, rel = "", size = 10) => ({ name, webkitRelativePath: rel, size 
   check("dupes numbered", dests.includes("roms/gb/a.b.gb") && dests.includes("roms/gb/a.b_2.gb"), dests.join(","));
   check("skipped", skipped.includes("wrong.gb") && skipped.includes("save.sav") && !skipped.includes(".DS_Store"), skipped.join(","));
   check("badge path rule", dests.every((d) => /^[A-Za-z0-9._\-/]{1,120}$/.test(d)), dests.join(","));
+}
+
+// ---- planFiles with a console picked ----
+{
+  const { out, skipped } = planFiles([f("pkmn.gb"), f("tank.nes"), f("x.gbc", "roms/gb/x.gbc")], "gbc");
+  const dests = out.map((p) => p.dest);
+  check("picked console wins over the ending", dests.includes("roms/gbc/pkmn.gb"), dests.join(","));
+  check("picked console wins over the folder", dests.includes("roms/gbc/x.gbc"), dests.join(","));
+  check("an .nes can't go to Game Boy Color", skipped.includes("tank.nes") && dests.length === 2, skipped.join(","));
+  const nes = planFiles([f("tank.nes"), f("pkmn.gb")], "nes");
+  check("NES picked", nes.out.length === 1 && nes.out[0].dest === "roms/nes/tank.nes" && nes.skipped.includes("pkmn.gb"),
+        nes.out.map((p) => p.dest).join(","));
+  const auto = planFiles([f("pkmn.gb")], "");
+  check("none picked: by ending", auto.out[0].dest === "roms/gb/pkmn.gb", auto.out[0].dest);
+}
+
+// ---- restartBadge: a real reset pulse that boots the firmware ----
+{
+  const calls = [];
+  const transport = { async setDTR(v) { calls.push("DTR" + +v); }, async setRTS(v) { calls.push("RTS" + +v); } };
+  await restartBadge(transport, async () => calls.push("wait"));
+  check("reset pulse", calls.join(" ") === "DTR0 RTS1 wait RTS0", calls.join(" "));
 }
 
 // ---- sendFile ----
