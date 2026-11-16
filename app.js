@@ -8,7 +8,7 @@
 
 import { ESPLoader, Transport } from "https://cdn.jsdelivr.net/npm/esptool-js@0.7.0/+esm";
 import { md5 } from "./md5.js";
-import { planFiles, BadgeConsole, sendFile, isBadgeBackup, readWholeFlash } from "./protocol.js";
+import { planFiles, BadgeConsole, sendFile, isBadgeBackup, readWholeFlash, restartBadge } from "./protocol.js";
 
 const CH340 = { usbVendorId: 0x1a86 };      // the badge's USB-serial chip
 const FLASH_BAUD = 230400;                  // faster rates drop bytes on the CH340 (measured)
@@ -89,7 +89,7 @@ async function backup() {
     };
     const image = await readWholeFlash(session, md5, (f) => setProgress("backup-progress", f));
     if (!isBadgeBackup(image)) throw new Error("What came back doesn't look like a badge (no bootloader or partition table).");
-    await link.loader.after("hard_reset");
+    await restartBadge(link.transport);
     const a = document.createElement("a");
     a.href = URL.createObjectURL(new Blob([image], { type: "application/octet-stream" }));
     a.download = `badge-backup-${new Date().toISOString().slice(0, 10)}.bin`;
@@ -139,7 +139,7 @@ async function restore(input) {
       reportProgress: (_, written) => setProgress("restore-progress", written / image.length),
       calculateMD5Hash: md5,
     });
-    await link.loader.after("hard_reset");
+    await restartBadge(link.transport);
     setProgress("restore-progress", 1);
     setStatus("restore-status", "Done: the badge is back to how it was in the backup. It's restarting now.", "ok");
   } catch (e) {
@@ -184,7 +184,7 @@ async function install() {
       reportProgress: (i, written) => setProgress("install-progress", (before[i] + written) / total),
       calculateMD5Hash: md5,                // the chip checks every part against this
     });
-    await loader.after("hard_reset");
+    await restartBadge(link.transport);
     setProgress("install-progress", 1);
     setStatus("install-status", `Done: Retro ${fw.version} is on your badge. It's restarting now.`, "ok");
   } catch (e) {
@@ -215,11 +215,27 @@ function showPlan(skipped) {
   $("copy").disabled = busy || !planned.length;
 }
 
+// The console picked for "Choose game files"; "" = by file ending.
+const chosenConsole = () => document.querySelector("input[name=console]:checked").value;
+let picked = null;                          // the files of the last "Choose game files", to sort again
+
 function pick(input) {
-  const { out, skipped } = planFiles(Array.from(input.files));
+  const files = Array.from(input.files);
+  picked = input.id === "files" ? files : null;
+  const { out, skipped } = planFiles(files, picked ? chosenConsole() : null);
   planned = out;
   showPlan(skipped);
   input.value = "";
+}
+
+function sortAgain() {
+  if (picked) {
+    const { out, skipped } = planFiles(picked, chosenConsole());
+    planned = out;
+    showPlan(skipped);
+  }
+  const c = chosenConsole();
+  $("files").accept = c === "nes" ? ".nes" : c ? ".gb,.gbc" : ".gb,.gbc,.nes";
 }
 
 async function copyGames() {
@@ -274,6 +290,7 @@ $("install").addEventListener("click", install);
 $("copy").addEventListener("click", copyGames);
 $("folder").addEventListener("change", (e) => pick(e.target));
 $("files").addEventListener("change", (e) => pick(e.target));
+for (const r of document.querySelectorAll("input[name=console]")) r.addEventListener("change", sortAgain);
 setBusy(false);
 fetch("firmware/firmware.json", { cache: "no-store" })
   .then((r) => r.json())
