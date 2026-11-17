@@ -1,7 +1,7 @@
 {
   "name": "Retro for Solana OS",
-  "version": "d82972c",
-  "built": "2026-11-16",
+  "version": "444801a",
+  "built": "2026-11-17",
   "flash": {
     "flash_mode": "dio",
     "flash_size": "16MB",
@@ -26,7 +26,7 @@
     {
       "path": "solana_os.bin",
       "offset": 131072,
-      "size": 2404256
+      "size": 2404368
     }
   ]
 }
