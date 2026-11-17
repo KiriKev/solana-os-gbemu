@@ -20,6 +20,8 @@ static SemaphoreHandle_t s_lcd_idle;    // see bsp_bus.h
 static esp_lcd_panel_handle_t s_panel;
 static bool s_inverted;
 static volatile bool s_blit;            // the transfer in flight is a bsp_display_blit(), not an LVGL flush
+static SemaphoreHandle_t s_blit_done;   // flush_done: a blit's transfer has ended
+static bool s_blit_held;                // the blitting task holds the LCD (only that task touches this)
 
 void bsp_lcd_hold(void)
 {
@@ -85,26 +87,47 @@ static bool flush_done(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data
 {
     BaseType_t woken = pdFALSE;
     if (s_blit) {
-        s_blit = false;                 // a blit: LVGL isn't waiting for it, don't tell it its flush is done
+        // A blit: LVGL isn't waiting for it. The hold goes back from the
+        // blitting task (blit_finish), not from here: that task may still be
+        // inside esp_lcd_panel_draw_bitmap, preempted after queueing the
+        // transfer, and a flush starting meanwhile would run esp_lcd's
+        // in-flight count from two tasks at once and wait forever for a
+        // transfer result that was already taken (a frozen game picture).
+        s_blit = false;
+        xSemaphoreGiveFromISR(s_blit_done, &woken);
     } else {
         lv_display_flush_ready(ctx);
+        xSemaphoreGiveFromISR(s_lcd_idle, &woken);
     }
-    xSemaphoreGiveFromISR(s_lcd_idle, &woken);
     return woken == pdTRUE;
 }
 
+// The blitting task: once its last transfer has ended, give the hold back.
+static void blit_finish(void)
+{
+    if (s_blit_held) {
+        xSemaphoreTake(s_blit_done, portMAX_DELAY);
+        s_blit_held = false;
+        bsp_lcd_release();
+    }
+}
+
 // The hold (bsp_bus.h) orders blits and LVGL flushes, so the flag always
-// belongs to the one transfer in flight; flush_done gives the hold back.
+// belongs to the one transfer in flight. Blits come from one task at a time:
+// it gets the hold back with its next blit or bsp_display_blit_wait().
 esp_err_t bsp_display_blit(int x0, int y0, int x1, int y1, const void *data)
 {
     if (!s_panel || !s_lcd_idle) {
         return ESP_ERR_INVALID_STATE;
     }
+    blit_finish();                      // the chunk before: LVGL and the card may go in between
     bsp_lcd_hold();
     s_blit = true;
+    s_blit_held = true;
     esp_err_t err = esp_lcd_panel_draw_bitmap(s_panel, x0, y0, x1, y1, data);
     if (err != ESP_OK) {
         s_blit = false;
+        s_blit_held = false;
         bsp_lcd_release();
     }
     return err;
@@ -112,8 +135,7 @@ esp_err_t bsp_display_blit(int x0, int y0, int x1, int y1, const void *data)
 
 void bsp_display_blit_wait(void)
 {
-    bsp_lcd_hold();
-    bsp_lcd_release();
+    blit_finish();
 }
 
 // The backlight pin is PWM'd by LEDC so the screen can dim (Settings >
@@ -231,6 +253,7 @@ lv_display_t *bsp_display_start(void)
     lv_display_t *disp = lvgl_port_add_disp(&disp_cfg);
     ESP_RETURN_ON_FALSE(disp, NULL, TAG, "lvgl display");
     s_lcd_idle = xSemaphoreCreateBinary();
+    s_blit_done = xSemaphoreCreateBinary();
     xSemaphoreGive(s_lcd_idle);
     const esp_lcd_panel_io_callbacks_t cbs = { .on_color_trans_done = flush_done };
     ESP_ERROR_CHECK(esp_lcd_panel_io_register_event_callbacks(io, &cbs, disp));

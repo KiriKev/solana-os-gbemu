@@ -60,7 +60,7 @@ bool bsp_display_inverted(void);
 // internal RAM and stay untouched until the next blit or blit_wait returns.
 // LVGL may still repaint the region (toasts); the next blit draws over it.
 esp_err_t bsp_display_blit(int x0, int y0, int x1, int y1, const void *data);
-void bsp_display_blit_wait(void);   // until the last blit has left the buffer
+void bsp_display_blit_wait(void);   // until the last blit has left the buffer; gives the LCD back to LVGL and the card
 
 // ---- Buttons ----
 #define BSP_BTN_PB(n)   (1u << ((n) - 1))   // n = 1..6

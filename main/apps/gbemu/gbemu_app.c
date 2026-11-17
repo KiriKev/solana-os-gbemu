@@ -794,6 +794,7 @@ static void disp_task(void *arg)
             bsp_display_blit(e->x, e->y + y0, e->x + e->w, e->y + y0 + rows, e->chunk[cur]);
             cur ^= 1;
         }
+        bsp_display_blit_wait();            // the LCD back to LVGL and the card until the next frame
         e->disp_busy = false;
     }
     bsp_display_blit_wait();
